@@ -1,0 +1,32 @@
+SYNTHETIC EXAMPLE — NOT AN ACTUAL GOVERNMENT DOCUMENT
+Northstar Department of Resident Services
+Digital Access Strategy 2027–2030
+Publication date: 2026-02-12
+
+1. Executive Summary
+
+The Northstar Department of Resident Services (NDRS) will modernize how residents apply for and manage public benefits. Residents currently navigate separate portals for assistance programs, repeat identity checks, and receive status notices through inconsistent channels. The department's strategic need is a single, accessible citizen-service experience that works on mobile devices, supports multiple languages, and lets a resident see application status without calling a service center.
+
+2. Current-State Challenges
+
+Legacy case systems exchange data through nightly files. Staff re-enter information when a resident reports a change to more than one program. Contact-center teams lack a consolidated view of prior notices and open requests. These conditions lengthen handling time and make it difficult to measure whether residents complete a service journey.
+
+3. Modernization Priorities
+
+Priority A — Unified access: provide one sign-on, guided intake, document upload, and status tracking across participating programs.
+
+Priority B — Reusable integration: expose governed APIs and event notifications without replacing every system of record at once.
+
+Priority C — Inclusive delivery: conform to WCAG 2.2 AA, provide translated content, test with residents, and maintain assisted-service options.
+
+4. Measures of Progress
+
+Measure | Synthetic baseline | 2030 target
+Digital application completion | 58 percent | 82 percent
+Status-related calls | 420,000 per year | 30 percent reduction
+Average change-report handling | 18 minutes | 10 minutes
+
+5. Governance
+
+The Office of Digital Services will sponsor the portfolio. Program operations, security, privacy, procurement, and the resident advisory panel will review releases quarterly. This strategy describes direction and does not itself authorize purchasing.
+

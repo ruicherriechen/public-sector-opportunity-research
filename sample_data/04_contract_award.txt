@@ -1,0 +1,24 @@
+SYNTHETIC EXAMPLE — NOT AN ACTUAL GOVERNMENT CONTRACT AWARD
+Northstar Department of Resident Services
+Notice of Intent to Award — NDRS-2028-017
+Publication date: 2028-01-22
+Effective date: 2028-02-15
+
+Award Summary
+
+Following evaluation of proposals for the fictional Resident Access and Integration Platform, NDRS announces its intent to award a contract to Aurora Civic Systems, a nonexistent example vendor. The evaluated amount is $11,850,000 for implementation and one year of operations support. The maximum value with fictional options is $17,200,000.
+
+Selected Scope
+
+The award covers the unified resident portal, federated identity connection, guided intake, document exchange, multilingual communications, status tracking, governed APIs to three benefits systems, accessibility assurance, security testing, training, and phased rollout described in the sample RFP.
+
+Award Basis
+
+The fictional evaluation committee rated the selected proposal highest overall based on its delivery plan, integration approach, accessibility testing method, and total evaluated price. This notice does not represent a real purchase, vendor relationship, public record, or statement by any government body.
+
+Administrative Dates
+
+Last updated: 2028-01-29
+Anticipated notice to proceed: 2028-02-15
+Initial term end: 2029-02-14
+

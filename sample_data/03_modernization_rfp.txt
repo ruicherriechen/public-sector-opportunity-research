@@ -1,0 +1,33 @@
+SYNTHETIC EXAMPLE — NOT AN ACTUAL GOVERNMENT SOLICITATION
+Northstar Department of Resident Services
+Request for Proposals NDRS-2028-017
+Resident Access and Integration Platform
+Publication date: 2027-09-18
+Proposal due date: 2027-11-03
+
+1. Purpose
+
+NDRS seeks a qualified contractor to configure and implement a secure resident access platform. The procurement follows the fictional Digital Access Strategy and is subject to available funding. This document is sample data and creates no procurement opportunity.
+
+2. Scope of Work
+
+The contractor shall deliver a responsive resident portal with federated identity, guided application intake, document upload, multilingual notices, preference management, and status tracking. The solution shall integrate with three existing eligibility systems through managed APIs and event messages.
+
+The contractor shall provide discovery, service design, configuration, integration, data migration support, automated testing, security documentation, accessibility testing, training, phased deployment, and twelve months of operations support.
+
+3. Technical and Service Requirements
+
+The platform must support least-privilege access, encryption in transit and at rest, auditable administrative actions, configurable retention, and recovery testing. Resident-facing functions must meet WCAG 2.2 AA. Bidders must describe performance under peak enrollment demand and their approach to zero-downtime releases.
+
+4. Deliverables and Schedule
+
+Deliverable | Target
+Discovery and validated service blueprint | 60 days after notice to proceed
+Minimum viable resident account | 180 days after notice to proceed
+First program integration | 270 days after notice to proceed
+Three-program production release | 420 days after notice to proceed
+
+5. Evaluation
+
+Technical approach: 35 points. Relevant implementation experience: 20 points. Delivery and staffing: 15 points. Security and accessibility: 15 points. Price: 15 points. NDRS may request demonstrations and clarification but will not accept unsupported claims as evidence.
+

@@ -1,0 +1,49 @@
+{
+  "dataset_name": "SYNTHETIC public-sector opportunity retrieval evaluation",
+  "description": "Hand-labeled fictional questions for the six-document Northstar corpus. Labels are subjective relevance judgments for capstone evaluation, not government facts.",
+  "agency_id": "synthetic-ndrs",
+  "cases": [
+    {
+      "case_id": "modernization_need",
+      "question": "What evidence shows a need to modernize citizen services and resident access?",
+      "relevant_document_ids": ["doc_1a225fe1da8b623c3d9b8d3c"],
+      "label_rationale": "The strategy is the primary source that announces the need and describes current-state problems."
+    },
+    {
+      "case_id": "budget_funding",
+      "question": "What budget or funding evidence supports the digital service renewal?",
+      "relevant_document_ids": ["doc_efdd05a3042dffdad5b70aca"],
+      "label_rationale": "The budget justification contains the fictional resource request and funding conditions."
+    },
+    {
+      "case_id": "confirmed_contract",
+      "question": "Was a contract executed for the resident access modernization, with what vendor and scope?",
+      "relevant_document_ids": ["doc_e277bfbab5cb0eaba6e0f510"],
+      "label_rationale": "Only the confirmed-award document establishes execution, vendor, dates, and finalized scope."
+    },
+    {
+      "case_id": "intent_uncertainty",
+      "question": "Is there a notice that signals an intended award but does not prove contract execution?",
+      "relevant_document_ids": ["doc_ab4b2bc864a3fc7d2f37a85e"],
+      "label_rationale": "The intent notice is relevant while remaining distinct from the executed contract."
+    },
+    {
+      "case_id": "payment_accuracy",
+      "question": "What evidence discusses benefits payment accuracy and incorrect payments?",
+      "relevant_document_ids": ["doc_b563026a0fa806482037ffe7"],
+      "label_rationale": "The program plan discusses payment correctness, overpayments, and underpayments."
+    },
+    {
+      "case_id": "program_integrity_synonyms",
+      "question": "What technology needs relate to benefits assurance, leakage control, fraud risk, and program integrity?",
+      "relevant_document_ids": ["doc_b563026a0fa806482037ffe7"],
+      "label_rationale": "This tests semantic matching across several terms used for related stewardship work."
+    },
+    {
+      "case_id": "absent_fleet_evidence",
+      "question": "What evidence describes electric vehicle fleet charging infrastructure?",
+      "relevant_document_ids": [],
+      "label_rationale": "The corpus contains no fleet or charging evidence; returned chunks are false positives for this question."
+    }
+  ]
+}

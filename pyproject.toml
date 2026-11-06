@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "public-sector-opportunity-research"
+version = "0.1.0"
+description = "Local RAG foundation for researching public-sector opportunities"
+requires-python = ">=3.11"
+
+[project.scripts]
+opportunity-research = "public_sector_opportunity_research.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+

@@ -1,0 +1,27 @@
+SYNTHETIC EXAMPLE — NOT AN ACTUAL GOVERNMENT DOCUMENT
+Northstar Department of Resident Services
+Fiscal Year 2028 Budget Justification — Digital Service Renewal
+Publication date: 2027-03-04
+Effective date: 2027-07-01
+
+Program Overview
+
+NDRS requests fictional spending authority for the first stage of the Digital Service Renewal initiative described in the 2027–2030 strategy. The request supports a unified resident portal, integration services, accessibility validation, and program change management.
+
+Requested Resources
+
+Category | FY2028 request | Purpose
+Platform implementation | $8,400,000 | Configurable portal, identity integration, workflow, notifications
+Data and API enablement | $3,100,000 | Governed interfaces to three benefits systems
+Independent assurance | $900,000 | Security, privacy, accessibility, and performance testing
+Program staffing | $1,600,000 | Product management, training, and adoption
+Total | $14,000,000 | Synthetic planning amount
+
+Funding Conditions
+
+Release of implementation funds is contingent on approval of an acquisition plan, architecture review, and measurable delivery milestones. Amounts shown are fabricated for testing and are not appropriations or evidence about a real jurisdiction.
+
+Expected Outcomes
+
+The initiative is expected to reduce duplicate data entry, improve digital completion, and lower avoidable status calls. Benefits will be measured by program and demographic segment so that aggregate gains do not conceal access barriers.
+

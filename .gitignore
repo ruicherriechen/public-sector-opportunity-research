@@ -1,0 +1,68 @@
+# Local configuration and credentials. Keep the documented empty template.
+.env
+.env.*
+!.env.example
+credentials*.json
+secrets*.json
+*.pem
+*.key
+
+# Python environments, bytecode, test state, and build artifacts.
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Local SQLite data and every common transaction sidecar format.
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Downloaded Hugging Face/Sentence Transformers caches and model weights.
+.cache/
+.huggingface/
+huggingface/
+models/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+
+# Generated downloads, logs, and temporary test/work files.
+downloads/
+tmp/
+temp/
+*.tmp
+*.temp
+*.log
+data/pytest-*/
+
+# Generated runs can contain local databases, provider response identifiers,
+# or future non-public material. Publish only the audited capstone artifacts.
+outputs/**
+!outputs/capstone-submission/
+!outputs/capstone-submission/DEMO_GUIDE.md
+!outputs/capstone-submission/FUTURE_ROADMAP.md
+!outputs/capstone-submission/IMPLEMENTATION_SUMMARY.md
+!outputs/capstone-submission/human_review_template.json
+!outputs/capstone-submission/opportunity_comparison.html
+!outputs/capstone-submission/rag_evaluation_report.html
+!outputs/capstone-submission/retrieval_evaluation.json
+

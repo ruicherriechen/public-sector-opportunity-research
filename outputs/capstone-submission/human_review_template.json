@@ -1,0 +1,52 @@
+[
+  {
+    "report_name": "opportunity_comparison",
+    "scenario": "scenario_b",
+    "category": "incorrect_semantic_association",
+    "feedback_text": "Replace with the reviewer's observation.",
+    "reviewer": null,
+    "trace_id": null,
+    "document_id": null,
+    "chunk_id": null
+  },
+  {
+    "report_name": "opportunity_comparison",
+    "scenario": "scenario_b",
+    "category": "potentially_missing_evidence",
+    "feedback_text": "Replace with the reviewer's observation.",
+    "reviewer": null,
+    "trace_id": null,
+    "document_id": null,
+    "chunk_id": null
+  },
+  {
+    "report_name": "opportunity_comparison",
+    "scenario": "scenario_b",
+    "category": "incorrect_reranking",
+    "feedback_text": "Replace with the reviewer's observation.",
+    "reviewer": null,
+    "trace_id": null,
+    "document_id": null,
+    "chunk_id": null
+  },
+  {
+    "report_name": "opportunity_comparison",
+    "scenario": "scenario_b",
+    "category": "unsupported_conclusion",
+    "feedback_text": "Replace with the reviewer's observation.",
+    "reviewer": null,
+    "trace_id": null,
+    "document_id": null,
+    "chunk_id": null
+  },
+  {
+    "report_name": "opportunity_comparison",
+    "scenario": "scenario_b",
+    "category": "scope_or_chronology_error",
+    "feedback_text": "Replace with the reviewer's observation.",
+    "reviewer": null,
+    "trace_id": null,
+    "document_id": null,
+    "chunk_id": null
+  }
+]

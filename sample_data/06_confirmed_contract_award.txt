@@ -1,0 +1,35 @@
+FUTURE-DATED SYNTHETIC EXAMPLE — NOT AN ACTUAL GOVERNMENT CONTRACT
+Northstar Department of Resident Services
+Executed Contract Notice — NDRS-2028-017-C1
+Contract execution date: 2028-02-15
+Publication date: 2028-02-20
+
+Confirmed Award
+
+The fictional Northstar Department of Resident Services and Aurora Civic
+Systems, a nonexistent example vendor, executed contract NDRS-2028-017-C1 on
+2028-02-15. The finalized initial contract value is $11,850,000 for
+implementation and one year of operations support. Fictional options may raise
+the maximum value to $17,200,000.
+
+Executed Scope
+
+The executed contract covers the unified resident portal, federated identity
+connection, guided intake, document exchange, multilingual communications,
+status tracking, governed APIs to three benefits systems, accessibility
+assurance, security testing, training, and phased rollout. This is
+substantially the same modernization scope described in the synthetic strategy
+and budget documents.
+
+Contract Status and Dates
+
+Contract status: Executed by both fictional parties
+Award date: 2028-02-15
+Execution date: 2028-02-15
+Service commencement date: 2028-02-22
+Initial term end: 2029-02-14
+Last updated: 2028-02-20
+
+This document is future-dated fictional scenario evidence created only for a
+software demonstration. It is not a public record, signed instrument, vendor
+relationship, or statement by a real government body.
