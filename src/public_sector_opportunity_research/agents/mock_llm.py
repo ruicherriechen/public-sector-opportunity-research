@@ -451,12 +451,23 @@ def _deduplicate_findings(findings: Sequence[ResearchFinding]) -> list[ResearchF
 def _theme_findings(
     findings: Sequence[ResearchFinding], terms: Sequence[str]
 ) -> list[ResearchFinding]:
-    """Select findings whose statements explicitly mention a synthetic theme."""
-    return [
+    """Select explicit theme matches plus facts from the same cited documents."""
+    direct = [
         item
         for item in findings
         if any(term in item.statement.casefold() for term in terms)
     ]
+    related_documents = {
+        document_id for item in direct for document_id in item.document_ids
+    }
+    return _deduplicate_findings(
+        [
+            item
+            for item in findings
+            if item in direct
+            or bool(set(item.document_ids).intersection(related_documents))
+        ]
+    )
 
 
 def _contains_need(findings: Sequence[ResearchFinding]) -> bool:

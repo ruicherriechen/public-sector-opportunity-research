@@ -28,7 +28,9 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 
 from .contracts import (
+    BudgetSummary,
     EvaluationOutput,
+    ModelCallRecord,
     ResearchGraphResult,
     ResearchTask,
     ResearcherOutput,
@@ -39,17 +41,19 @@ from .independent_evaluator import (
     independent_evaluator_node,
     route_after_evaluation,
 )
+from .mock_llm import AgentBudgetTracker, StructuredAgentModel, SyntheticMockAgentModel
 from .procurement_researcher import make_procurement_researcher_node
 from .rag_service import LocalEvidenceService
 from .research_manager import research_manager_node
 from .state import ResearchGraphState
 from .strategy_researcher import make_strategy_researcher_node
-from .synthesis_agent import synthesis_agent_node
+from .synthesis_agent import make_synthesis_agent_node
 
 
 def build_research_graph(
     service: LocalEvidenceService,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
+    agent_model: StructuredAgentModel | None = None,
 ):
     """Build and compile the reusable typed research graph.
 
@@ -57,6 +61,8 @@ def build_research_graph(
         service: Shared local RAG adapter used by both researcher branches.
         checkpointer: Optional LangGraph saver.  Tests may omit it; the offline
             runner supplies a local SQLite saver.
+        agent_model: Structured analysis boundary. When omitted, the synthetic
+            deterministic mock is used; no live client is constructed.
 
     Returns:
         A compiled LangGraph runnable.  Building it performs no retrieval and
@@ -66,15 +72,16 @@ def build_research_graph(
     therefore waits for both researchers, while annotated reducers merge their
     concurrent partial-state updates.
     """
+    model = agent_model or SyntheticMockAgentModel()
     builder = StateGraph(ResearchGraphState)
     builder.add_node("research_manager", research_manager_node)
     builder.add_node(
-        "strategy_researcher", make_strategy_researcher_node(service)
+        "strategy_researcher", make_strategy_researcher_node(service, model)
     )
     builder.add_node(
-        "procurement_researcher", make_procurement_researcher_node(service)
+        "procurement_researcher", make_procurement_researcher_node(service, model)
     )
-    builder.add_node("synthesis_agent", synthesis_agent_node)
+    builder.add_node("synthesis_agent", make_synthesis_agent_node(model))
     builder.add_node("independent_evaluator", independent_evaluator_node)
     builder.add_node("complete", _complete_node)
     builder.add_node("human_review", _human_review_node)
@@ -115,6 +122,10 @@ def run_offline_research_graph(
     thread_id: str | None = None,
     as_of_date: str | None = None,
     freshness_cutoff_date: str | None = None,
+    max_agent_calls: int = 6,
+    max_agent_input_tokens: int = 12000,
+    max_agent_output_tokens: int = 6000,
+    agent_model: StructuredAgentModel | None = None,
 ) -> ResearchGraphResult:
     """Run the deterministic offline graph with durable local checkpoints.
 
@@ -129,6 +140,11 @@ def run_offline_research_graph(
         as_of_date: Optional historical source eligibility cutoff.
         freshness_cutoff_date: Optional earliest desirable source date used for
             labels only; it does not filter out older evidence.
+        max_agent_calls: Maximum structured researcher/synthesis calls.
+        max_agent_input_tokens: Workflow-wide approximate input-token limit.
+        max_agent_output_tokens: Workflow-wide approximate output-token limit.
+        agent_model: Optional test/live implementation. Omission uses the
+            reproducible synthetic mock and never accesses credentials.
 
     Returns:
         A schema-validated structured result containing evidence, trace IDs,
@@ -142,6 +158,12 @@ def run_offline_research_graph(
     """
     if max_iterations < 1:
         raise ValueError("max_iterations must be at least 1")
+    budget = AgentBudgetTracker(
+        max_calls=max_agent_calls,
+        max_input_tokens=max_agent_input_tokens,
+        max_output_tokens=max_agent_output_tokens,
+    )
+    model = agent_model or SyntheticMockAgentModel(budget)
     selected_thread_id = (thread_id or f"offline-{uuid4().hex}").strip()
     if not selected_thread_id:
         raise ValueError("thread_id must not be blank")
@@ -154,7 +176,7 @@ def run_offline_research_graph(
     connection = sqlite3.connect(checkpoint_file, check_same_thread=False)
     try:
         checkpointer = SqliteSaver(connection)
-        graph = build_research_graph(service, checkpointer)
+        graph = build_research_graph(service, checkpointer, model)
         initial_state: ResearchGraphState = {
             "agency_id": agency_id,
             "objective": objective,
@@ -163,8 +185,12 @@ def run_offline_research_graph(
             "max_iterations": max_iterations,
             "iteration": 0,
             "thread_id": selected_thread_id,
+            "max_agent_calls": max_agent_calls,
+            "max_agent_input_tokens": max_agent_input_tokens,
+            "max_agent_output_tokens": max_agent_output_tokens,
             "tasks": [],
             "researcher_outputs": [],
+            "model_calls": [],
             "execution_trace": [],
         }
         # A checkpointer groups snapshots by thread_id.  The recursion limit is
@@ -206,7 +232,7 @@ def _finalize_state(
         iteration=iteration,
         node=status,
         detail=(
-            "Placeholder graph completed structural checks."
+            "Offline mock-agent workflow completed deterministic checks."
             if status == "complete"
             else "Placeholder graph stopped for human review."
         ),
@@ -218,6 +244,9 @@ def _finalize_state(
     outputs = [
         ResearcherOutput.model_validate(item)
         for item in state.get("researcher_outputs", [])
+    ]
+    model_calls = [
+        ModelCallRecord.model_validate(item) for item in state.get("model_calls", [])
     ]
     trace_ids = sorted(
         {
@@ -237,11 +266,28 @@ def _finalize_state(
         synthesis=SynthesisOutput.model_validate(state["synthesis"]),
         evaluation=EvaluationOutput.model_validate(state["evaluation"]),
         retrieval_trace_ids=trace_ids,
+        model_calls=model_calls,
+        budget=BudgetSummary(
+            calls_used=len(model_calls),
+            max_calls=int(state["max_agent_calls"]),
+            input_tokens_used=sum(item.input_tokens for item in model_calls),
+            max_input_tokens=int(state["max_agent_input_tokens"]),
+            output_tokens_used=sum(item.output_tokens for item in model_calls),
+            max_output_tokens=int(state["max_agent_output_tokens"]),
+            within_budget=(
+                len(model_calls) <= int(state["max_agent_calls"])
+                and sum(item.input_tokens for item in model_calls)
+                <= int(state["max_agent_input_tokens"])
+                and sum(item.output_tokens for item in model_calls)
+                <= int(state["max_agent_output_tokens"])
+            ),
+        ),
         execution_trace=trace,
         placeholder_notice=(
-            "This run demonstrates orchestration, local RAG retrieval, merging, "
-            "routing, and checkpointing. It does not implement autonomous "
-            "research reasoning, opportunity prioritization, or web search."
+            "This run uses deterministic schema-validated mock LLM responses over "
+            "local synthetic RAG evidence. Researchers and synthesis are functional "
+            "offline demonstrations, not general autonomous agents. Web search and "
+            "live model execution are not implemented."
         ),
     )
     return {

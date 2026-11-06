@@ -1,24 +1,36 @@
-"""Implement the deterministic Synthesis Agent placeholder.
+"""Implement evidence-grounded opportunity synthesis with an offline mock.
 
 LangGraph starts this node only after both researcher branches complete.  The
-node validates current-iteration outputs, deduplicates passages by stable chunk
-ID, records which role supplied each citation, and combines missing categories.
-It does not prioritize opportunities, map buying personas, or generate new
-claims; those fields remain visibly empty in the typed output.
+node validates current-iteration outputs, deduplicates compact evidence and
+findings, and calls the structured model boundary.  The reproducible mock merges
+overlapping synthetic themes, ranks supported enterprise-software candidates,
+and keeps executed scope distinct from potentially available needs.
 
-Before synthesis, evidence is still grouped by researcher.  After synthesis,
-the Independent Evaluator receives one consolidated evidence catalog and can
-verify coverage and citations.  A future LLM-based synthesizer should add
-grounded interpretations while retaining IDs from this catalog.
+No target opportunity count is used. Before synthesis, evidence is grouped by
+researcher. Afterward, the deterministic Independent Evaluator verifies every
+finding/opportunity citation and business-rule claim.
 """
 
 from __future__ import annotations
 
 from .contracts import ResearcherOutput, SynthesisOutput, TraceEvent
+from .mock_llm import StructuredAgentModel
 from .state import ResearchGraphState
 
 
-def synthesis_agent_node(state: ResearchGraphState) -> dict[str, object]:
+def make_synthesis_agent_node(model: StructuredAgentModel):
+    """Create a synthesis node bound to the shared structured model boundary."""
+
+    def synthesis_agent_node(state: ResearchGraphState) -> dict[str, object]:
+        """Consolidate both branches and generate cited opportunity candidates."""
+        return _synthesize(state, model)
+
+    return synthesis_agent_node
+
+
+def _synthesize(
+    state: ResearchGraphState, model: StructuredAgentModel
+) -> dict[str, object]:
     """Consolidate current parallel outputs without inventing findings.
 
     Args:
@@ -45,10 +57,11 @@ def synthesis_agent_node(state: ResearchGraphState) -> dict[str, object]:
             f"received {sorted(roles)}"
         )
 
-    # Stable chunk IDs are the deduplication key.  If both roles ever retrieve
+    # Stable chunk and finding IDs are the deduplication keys. If both roles retrieve
     # one passage, the full record is stored once while both role mappings keep
     # the citation visible.
     evidence_by_chunk = {}
+    findings_by_id = {}
     evidence_by_role: dict[str, list[str]] = {
         "strategy": [],
         "procurement": [],
@@ -56,6 +69,8 @@ def synthesis_agent_node(state: ResearchGraphState) -> dict[str, object]:
     unresolved: set[str] = set()
     for output in outputs:
         unresolved.update(output.missing_categories)
+        for finding in output.findings:
+            findings_by_id.setdefault(finding.finding_id, finding)
         for evidence in output.evidence:
             evidence_by_chunk.setdefault(evidence.chunk_id, evidence)
             evidence_by_role[output.role].append(evidence.chunk_id)
@@ -64,26 +79,55 @@ def synthesis_agent_node(state: ResearchGraphState) -> dict[str, object]:
     for role in evidence_by_role:
         evidence_by_role[role] = sorted(set(evidence_by_role[role]))
 
+    findings = [findings_by_id[key] for key in sorted(findings_by_id)]
+    invocation = model.synthesize(
+        objective=str(state["objective"]),
+        findings=findings,
+        evidence=evidence,
+        iteration=iteration,
+    )
+    _validate_opportunity_citations(
+        invocation.output.opportunities, findings, evidence
+    )
+
     synthesis = SynthesisOutput(
         iteration=iteration,
         evidence=evidence,
         evidence_by_role=evidence_by_role,
+        findings=findings,
         unresolved_categories=sorted(unresolved),
-        opportunity_priorities=[],
-        buying_personas=[],
-        summary=(
-            f"Placeholder synthesis consolidated {len(evidence)} unique cited "
-            "passages. Opportunity prioritization and persona mapping are not "
-            "implemented."
-        ),
+        opportunities=invocation.output.opportunities,
+        summary=invocation.output.summary,
     )
     event = TraceEvent(
         event_id=f"{iteration}:synthesis_agent",
         iteration=iteration,
         node="synthesis_agent",
-        detail=f"Deduplicated evidence into {len(evidence)} stable chunk citations.",
+        detail=(
+            f"Merged {len(findings)} findings into "
+            f"{len(invocation.output.opportunities)} grounded opportunity candidates."
+        ),
     )
     return {
         "synthesis": synthesis.model_dump(mode="json"),
+        "model_calls": [invocation.call.model_dump(mode="json")],
         "execution_trace": [event.model_dump(mode="json")],
     }
+
+
+def _validate_opportunity_citations(opportunities, findings, evidence) -> None:
+    """Reject synthesis output that references unknown findings or evidence."""
+    finding_ids = {item.finding_id for item in findings}
+    chunk_ids = {item.chunk_id for item in evidence}
+    document_ids = {item.document_id for item in evidence}
+    for opportunity in opportunities:
+        if not set(opportunity.supporting_finding_ids).issubset(finding_ids):
+            raise ValueError(
+                f"Unknown finding citation: {opportunity.opportunity_id}"
+            )
+        if not set(opportunity.supporting_chunk_ids).issubset(chunk_ids):
+            raise ValueError(f"Unknown chunk citation: {opportunity.opportunity_id}")
+        if not set(opportunity.supporting_document_ids).issubset(document_ids):
+            raise ValueError(
+                f"Unknown document citation: {opportunity.opportunity_id}"
+            )

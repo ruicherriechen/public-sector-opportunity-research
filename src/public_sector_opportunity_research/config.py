@@ -45,6 +45,9 @@ class Settings:
             checkpoints. It does not store source evidence or vectors.
         langgraph_max_iterations: Maximum manager/research/evaluation cycles
             before an unresolved run is sent to human review.
+        langgraph_max_agent_calls: Workflow-wide structured model-call limit.
+        langgraph_max_input_tokens: Approximate input-token budget.
+        langgraph_max_output_tokens: Approximate output-token budget.
         openai_assessment_model: Responses API model used for schema-validated
             opportunity assessments. The API key is intentionally not stored
             in this object; the OpenAI client reads it from ``OPENAI_API_KEY``.
@@ -67,6 +70,9 @@ class Settings:
     embedding_batch_size: int = 32
     langgraph_checkpoint_path: Path = Path("data/langgraph_checkpoints.sqlite3")
     langgraph_max_iterations: int = 2
+    langgraph_max_agent_calls: int = 6
+    langgraph_max_input_tokens: int = 12000
+    langgraph_max_output_tokens: int = 6000
     openai_assessment_model: str = "gpt-6-luna"
 
     @classmethod
@@ -118,6 +124,15 @@ class Settings:
             ),
             langgraph_max_iterations=int(
                 os.getenv("LANGGRAPH_MAX_ITERATIONS", "2")
+            ),
+            langgraph_max_agent_calls=int(
+                os.getenv("LANGGRAPH_MAX_AGENT_CALLS", "6")
+            ),
+            langgraph_max_input_tokens=int(
+                os.getenv("LANGGRAPH_MAX_INPUT_TOKENS", "12000")
+            ),
+            langgraph_max_output_tokens=int(
+                os.getenv("LANGGRAPH_MAX_OUTPUT_TOKENS", "6000")
             ),
             openai_assessment_model=os.getenv(
                 "OPENAI_ASSESSMENT_MODEL", "gpt-6-luna"
