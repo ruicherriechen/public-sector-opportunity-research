@@ -44,6 +44,8 @@ from .models import Chunk, DocumentMetadata
 # * embedding_config: one persisted vector-model contract.
 # * retrieval_traces: structured JSON audit records for semantic queries.
 # * human_reviews: reviewer observations, never treated as verified evidence.
+# * human_review_decisions: dashboard decisions linked to immutable graph runs.
+# * source_discovery_runs/discovered_sources: bounded web-research audit data.
 # The dimension-specific vec0 table is created separately after the model loads.
 # Indexes speed common agency, date, chunk-order, and trace-time lookups.
 SCHEMA = """
@@ -131,6 +133,99 @@ CREATE TABLE IF NOT EXISTS human_reviews (
 
 CREATE INDEX IF NOT EXISTS idx_human_reviews_report
     ON human_reviews(report_name, created_at);
+
+CREATE TABLE IF NOT EXISTS human_review_decisions (
+    review_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    opportunity_id TEXT,
+    decision TEXT NOT NULL CHECK (decision IN (
+        'approved',
+        'rejected',
+        'needs_more_research'
+    )),
+    notes TEXT NOT NULL DEFAULT '',
+    reviewer TEXT,
+    reviewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (run_id, target_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_human_review_decisions_run
+    ON human_review_decisions(run_id, reviewed_at);
+
+CREATE TABLE IF NOT EXISTS human_feedback (
+    feedback_id TEXT PRIMARY KEY,
+    agency_id TEXT NOT NULL,
+    opportunity_id TEXT NOT NULL,
+    original_run_id TEXT NOT NULL,
+    feedback_type TEXT NOT NULL CHECK (feedback_type IN ('agree', 'disagree')),
+    review_decision TEXT,
+    explanation TEXT NOT NULL DEFAULT '',
+    assessment_json TEXT NOT NULL,
+    assessment_fingerprint TEXT NOT NULL,
+    cited_evidence_ids_json TEXT NOT NULL,
+    procurement_evidence_ids_json TEXT NOT NULL,
+    source_dates_json TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    followup_status TEXT NOT NULL DEFAULT 'not_requested' CHECK (
+        followup_status IN (
+            'not_requested', 'awaiting_authorization', 'research_requested',
+            'completed', 'failed'
+        )
+    ),
+    followup_run_id TEXT,
+    followup_output_path TEXT,
+    followup_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_human_feedback_opportunity
+    ON human_feedback(agency_id, opportunity_id, reviewed_at);
+
+CREATE TABLE IF NOT EXISTS source_discovery_runs (
+    run_id TEXT PRIMARY KEY,
+    agency_id TEXT NOT NULL,
+    agency_name TEXT NOT NULL,
+    objective TEXT NOT NULL,
+    status TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    failures_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_discovery_runs_agency
+    ON source_discovery_runs(agency_id, created_at);
+
+CREATE TABLE IF NOT EXISTS discovered_sources (
+    source_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES source_discovery_runs(run_id),
+    agency_id TEXT NOT NULL,
+    agency_name TEXT NOT NULL,
+    adapter TEXT NOT NULL,
+    canonical_url TEXT NOT NULL,
+    title TEXT NOT NULL,
+    document_type TEXT NOT NULL,
+    source_identifier TEXT,
+    publication_date TEXT,
+    effective_date TEXT,
+    last_updated_date TEXT,
+    content_type TEXT,
+    preview_text TEXT NOT NULL DEFAULT '',
+    structured_text TEXT,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    content_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'discovered',
+    error_type TEXT,
+    error_message TEXT,
+    document_id TEXT,
+    discovered_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (agency_id, adapter, canonical_url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_discovered_sources_run
+    ON discovered_sources(run_id, status);
+CREATE INDEX IF NOT EXISTS idx_discovered_sources_agency
+    ON discovered_sources(agency_id, document_type, updated_at);
 """
 
 
@@ -391,6 +486,44 @@ class SQLiteStore:
             row = connection.execute("SELECT COUNT(*) AS count FROM chunk_embeddings").fetchone()
             return int(row["count"])
 
+    def evidence_inventory(self, agency_id: str) -> dict[str, object]:
+        """Count usable relational and vector evidence before model inference.
+
+        A registered agency row is not evidence. This check requires documents
+        with extracted chunks and vectors belonging to the same agency, and it
+        reports the stored document categories so the caller can distinguish
+        an empty new agency from a partially covered existing corpus.
+        """
+
+        with self.connect() as connection:
+            row = connection.execute(
+                """SELECT COUNT(DISTINCT d.document_id) AS documents,
+                          COUNT(c.chunk_id) AS chunks
+                   FROM documents d
+                   LEFT JOIN chunks c ON c.document_id=d.document_id
+                   WHERE d.agency_id=? AND c.chunk_id IS NOT NULL""",
+                (agency_id,),
+            ).fetchone()
+            categories = [
+                str(item["document_type"])
+                for item in connection.execute(
+                    """SELECT DISTINCT document_type FROM documents
+                       WHERE agency_id=? ORDER BY document_type""",
+                    (agency_id,),
+                )
+            ]
+        with self.vector_connect() as connection:
+            vector_row = connection.execute(
+                "SELECT COUNT(*) AS count FROM chunk_embeddings WHERE agency_id=?",
+                (agency_id,),
+            ).fetchone()
+        return {
+            "documents": int(row["documents"]),
+            "chunks": int(row["chunks"]),
+            "vectors": int(vector_row["count"]),
+            "categories": categories,
+        }
+
     def semantic_candidates(
         self,
         query_vector: Sequence[float],
@@ -443,6 +576,68 @@ class SQLiteStore:
             ORDER BY m.distance ASC
         """
         with self.vector_connect() as connection:
+            return connection.execute(sql, parameters).fetchall()
+
+    def metadata_supplement_candidates(
+        self,
+        *,
+        agency_id: str,
+        document_type: str,
+        title_terms: Sequence[str],
+        excluded_document_ids: Sequence[str] = (),
+        as_of_date: str | None = None,
+        document_limit: int = 2,
+    ) -> list[sqlite3.Row]:
+        """Return chunks from the newest major documents missed by vector top-K.
+
+        This is a deliberately small relational supplement, not a replacement
+        for sqlite-vec. Document identity is selected from reviewed metadata,
+        using last-updated/publication/effective dates only for ordering. Fiscal
+        years in titles are never promoted to source dates. Historical cutoffs
+        retain the stricter publication/effective-date rule used by vec0.
+        """
+        clean_terms = [term.casefold().strip() for term in title_terms if term.strip()]
+        if not clean_terms or document_limit < 1:
+            return []
+        title_predicate = " OR ".join("LOWER(title) LIKE ?" for _ in clean_terms)
+        conditions = ["agency_id = ?", "document_type = ?", f"({title_predicate})"]
+        parameters: list[object] = [agency_id, document_type]
+        parameters.extend(f"%{term}%" for term in clean_terms)
+        if excluded_document_ids:
+            placeholders = ",".join("?" for _ in excluded_document_ids)
+            conditions.append(f"document_id NOT IN ({placeholders})")
+            parameters.extend(excluded_document_ids)
+        if as_of_date is not None:
+            conditions.append(
+                "COALESCE(publication_date, effective_date) IS NOT NULL AND "
+                "COALESCE(publication_date, effective_date) <= ?"
+            )
+            parameters.append(as_of_date)
+        parameters.append(document_limit)
+        sql = f"""
+            WITH selected_documents AS (
+                SELECT document_id
+                FROM documents
+                WHERE {' AND '.join(conditions)}
+                ORDER BY COALESCE(last_updated_date, publication_date,
+                                  effective_date, '') DESC,
+                         title ASC
+                LIMIT ?
+            )
+            SELECT c.chunk_id, c.document_id, c.text, c.section_heading,
+                   c.page_number, d.agency_id, a.name AS agency_name,
+                   d.title AS document_title, d.document_type, d.source_url,
+                   d.publication_date, d.effective_date, d.last_updated_date,
+                   d.capture_date
+            FROM selected_documents s
+            JOIN chunks c ON c.document_id = s.document_id
+            JOIN documents d ON d.document_id = c.document_id
+            JOIN agencies a ON a.agency_id = d.agency_id
+            ORDER BY COALESCE(d.last_updated_date, d.publication_date,
+                              d.effective_date, '') DESC,
+                     d.title ASC, c.chunk_index ASC
+        """
+        with self.connect() as connection:
             return connection.execute(sql, parameters).fetchall()
 
     def save_retrieval_trace(
@@ -531,6 +726,401 @@ class SQLiteStore:
         sql += " ORDER BY created_at, review_id"
         with self.connect() as connection:
             return connection.execute(sql, parameters).fetchall()
+
+    def save_review_decision(
+        self,
+        *,
+        review_id: str,
+        run_id: str,
+        target_id: str,
+        decision: str,
+        notes: str,
+        opportunity_id: str | None = None,
+        reviewer: str | None = None,
+    ) -> None:
+        """Insert or update one dashboard decision without changing agent data.
+
+        Args:
+            review_id: Unique identifier generated by the dashboard service.
+            run_id: Immutable graph ``thread_id`` from the saved result.
+            target_id: Opportunity ID, or the reserved run-level target used
+                when a human-review run contains no opportunities.
+            decision: ``approved``, ``rejected``, or ``needs_more_research``.
+            notes: Reviewer's explanation, stored exactly as entered.
+            opportunity_id: Original opportunity identifier when one exists.
+            reviewer: Optional local reviewer name or label.
+
+        Side effects:
+            Writes only ``human_review_decisions``. Re-reviewing the same run
+            target updates its decision, notes, reviewer, and timestamp while
+            leaving model output, evidence, traces, and evaluator results intact.
+        """
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO human_review_decisions (
+                    review_id, run_id, target_id, opportunity_id, decision,
+                    notes, reviewer
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id, target_id) DO UPDATE SET
+                    decision = excluded.decision,
+                    notes = excluded.notes,
+                    reviewer = excluded.reviewer,
+                    reviewed_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    review_id,
+                    run_id,
+                    target_id,
+                    opportunity_id,
+                    decision,
+                    notes,
+                    reviewer,
+                ),
+            )
+
+    def get_review_decision(
+        self, run_id: str, target_id: str
+    ) -> sqlite3.Row | None:
+        """Return the latest persisted dashboard decision for one target."""
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT * FROM human_review_decisions
+                WHERE run_id = ? AND target_id = ?
+                """,
+                (run_id, target_id),
+            ).fetchone()
+
+    def list_review_decisions(self, run_id: str | None = None) -> list[sqlite3.Row]:
+        """List dashboard decisions, optionally restricted to one graph run."""
+        sql = "SELECT * FROM human_review_decisions"
+        parameters: tuple[str, ...] = ()
+        if run_id is not None:
+            sql += " WHERE run_id = ?"
+            parameters = (run_id,)
+        sql += " ORDER BY reviewed_at DESC, review_id"
+        with self.connect() as connection:
+            return connection.execute(sql, parameters).fetchall()
+
+    def save_human_feedback(
+        self,
+        *,
+        feedback_id: str,
+        agency_id: str,
+        opportunity_id: str,
+        original_run_id: str,
+        feedback_type: str,
+        review_decision: str | None,
+        explanation: str,
+        assessment_json: str,
+        assessment_fingerprint: str,
+        cited_evidence_ids_json: str,
+        procurement_evidence_ids_json: str,
+        source_dates_json: str,
+    ) -> None:
+        """Store one immutable reviewer feedback snapshot.
+
+        Feedback is intentionally separate from documents, chunks, retrieval
+        traces, model findings, and the existing approve/reject decision. The
+        snapshot records exactly what the reviewer saw so later runs can tell
+        whether an agreement still applies to unchanged evidence.
+        """
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO human_feedback (
+                    feedback_id, agency_id, opportunity_id, original_run_id,
+                    feedback_type, review_decision, explanation,
+                    assessment_json, assessment_fingerprint,
+                    cited_evidence_ids_json, procurement_evidence_ids_json,
+                    source_dates_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    feedback_id,
+                    agency_id,
+                    opportunity_id,
+                    original_run_id,
+                    feedback_type,
+                    review_decision,
+                    explanation,
+                    assessment_json,
+                    assessment_fingerprint,
+                    cited_evidence_ids_json,
+                    procurement_evidence_ids_json,
+                    source_dates_json,
+                ),
+            )
+
+    def get_human_feedback(self, feedback_id: str) -> sqlite3.Row | None:
+        """Return one feedback record by its stable identifier."""
+        with self.connect() as connection:
+            return connection.execute(
+                "SELECT * FROM human_feedback WHERE feedback_id = ?",
+                (feedback_id,),
+            ).fetchone()
+
+    def list_human_feedback(
+        self,
+        *,
+        agency_id: str | None = None,
+        opportunity_id: str | None = None,
+    ) -> list[sqlite3.Row]:
+        """List feedback newest-first with optional deterministic filters."""
+        conditions: list[str] = []
+        parameters: list[str] = []
+        if agency_id is not None:
+            conditions.append("agency_id = ?")
+            parameters.append(agency_id)
+        if opportunity_id is not None:
+            conditions.append("opportunity_id = ?")
+            parameters.append(opportunity_id)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        with self.connect() as connection:
+            return connection.execute(
+                f"SELECT * FROM human_feedback{where} "
+                "ORDER BY reviewed_at DESC, feedback_id DESC",
+                parameters,
+            ).fetchall()
+
+    def update_feedback_followup(
+        self,
+        feedback_id: str,
+        *,
+        status: str,
+        followup_run_id: str | None = None,
+        followup_output_path: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Record one explicit follow-up attempt without changing feedback."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE human_feedback
+                SET followup_status = ?,
+                    followup_run_id = COALESCE(?, followup_run_id),
+                    followup_output_path = COALESCE(?, followup_output_path),
+                    followup_error = ?
+                WHERE feedback_id = ?
+                """,
+                (
+                    status,
+                    followup_run_id,
+                    followup_output_path,
+                    error_message,
+                    feedback_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Unknown human feedback: {feedback_id}")
+
+    def get_chunk_with_document(self, chunk_id: str) -> sqlite3.Row | None:
+        """Return complete chunk text joined to its original source metadata."""
+        with self.connect() as connection:
+            return connection.execute(
+                """
+                SELECT c.*, d.agency_id, d.title AS document_title,
+                       d.document_type, d.source_url, d.publication_date,
+                       d.effective_date, d.last_updated_date, d.capture_date,
+                       d.metadata_json, a.name AS agency_name
+                FROM chunks c
+                JOIN documents d ON d.document_id = c.document_id
+                JOIN agencies a ON a.agency_id = d.agency_id
+                WHERE c.chunk_id = ?
+                """,
+                (chunk_id,),
+            ).fetchone()
+
+    def get_agency_name(self, agency_id: str) -> str | None:
+        """Return the human-readable agency name without inferring one."""
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT name FROM agencies WHERE agency_id = ?", (agency_id,)
+            ).fetchone()
+        return str(row["name"]) if row else None
+
+    def upsert_agency(self, agency_id: str, agency_name: str) -> None:
+        """Create or rename one agency metadata row without touching evidence.
+
+        Agency registration uses this method to prepare a valid but empty RAG
+        database. Normal document ingestion may call it in the future before
+        saving documents. Existing documents, chunks, vectors, traces, and
+        review decisions are not changed.
+        """
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO agencies (agency_id, name)
+                VALUES (?, ?)
+                ON CONFLICT(agency_id) DO UPDATE SET
+                    name = excluded.name,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (agency_id, agency_name),
+            )
+
+    def save_discovery_run(
+        self,
+        *,
+        run_id: str,
+        agency_id: str,
+        agency_name: str,
+        objective: str,
+        status: str,
+        config: dict[str, object],
+        failures: list[dict[str, object]],
+    ) -> None:
+        """Persist one bounded source-discovery audit record.
+
+        Discovery failures are stored as structured JSON because they describe
+        coverage gaps, not verified document facts. No source candidate is
+        promoted into the normal evidence tables by this method.
+        """
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO source_discovery_runs (
+                    run_id, agency_id, agency_name, objective, status,
+                    config_json, failures_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    status = excluded.status,
+                    config_json = excluded.config_json,
+                    failures_json = excluded.failures_json
+                """,
+                (
+                    run_id,
+                    agency_id,
+                    agency_name,
+                    objective,
+                    status,
+                    json.dumps(config, sort_keys=True),
+                    json.dumps(failures, sort_keys=True),
+                ),
+            )
+
+    def upsert_discovered_source(
+        self, *, run_id: str, source: dict[str, object]
+    ) -> None:
+        """Store or refresh one candidate without ingesting it as evidence.
+
+        The stable source ID and canonical URL prevent repeated searches from
+        creating candidate duplicates. Changed provider metadata replaces the
+        preview row, while any prior ingestion identity remains available until
+        a later ingestion attempt updates it.
+        """
+        metadata = source.get("metadata") or {}
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO discovered_sources (
+                    source_id, run_id, agency_id, agency_name, adapter,
+                    canonical_url, title, document_type, source_identifier,
+                    publication_date, effective_date, last_updated_date,
+                    content_type, preview_text, structured_text, metadata_json,
+                    status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered')
+                ON CONFLICT(source_id) DO UPDATE SET
+                    run_id = excluded.run_id,
+                    title = excluded.title,
+                    document_type = excluded.document_type,
+                    source_identifier = excluded.source_identifier,
+                    publication_date = excluded.publication_date,
+                    effective_date = excluded.effective_date,
+                    last_updated_date = excluded.last_updated_date,
+                    content_type = excluded.content_type,
+                    preview_text = excluded.preview_text,
+                    structured_text = excluded.structured_text,
+                    metadata_json = excluded.metadata_json,
+                    status = 'discovered',
+                    error_type = NULL,
+                    error_message = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    source["source_id"],
+                    run_id,
+                    source["agency_id"],
+                    source["agency_name"],
+                    source["adapter"],
+                    source["canonical_url"],
+                    source["title"],
+                    source["document_type"],
+                    source.get("source_identifier"),
+                    _iso_value(source.get("publication_date")),
+                    _iso_value(source.get("effective_date")),
+                    _iso_value(source.get("last_updated_date")),
+                    source.get("content_type"),
+                    source.get("preview_text") or "",
+                    source.get("structured_text"),
+                    json.dumps(metadata, sort_keys=True),
+                ),
+            )
+
+    def list_discovered_sources(
+        self,
+        *,
+        agency_id: str | None = None,
+        run_id: str | None = None,
+        statuses: Sequence[str] | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return candidate rows selected for preview or later ingestion."""
+        conditions: list[str] = []
+        parameters: list[object] = []
+        if agency_id is not None:
+            conditions.append("agency_id = ?")
+            parameters.append(agency_id)
+        if run_id is not None:
+            conditions.append("run_id = ?")
+            parameters.append(run_id)
+        if statuses is not None:
+            if not statuses:
+                return []
+            placeholders = ", ".join("?" for _ in statuses)
+            conditions.append(f"status IN ({placeholders})")
+            parameters.extend(statuses)
+        where = " WHERE " + " AND ".join(conditions) if conditions else ""
+        with self.connect() as connection:
+            return connection.execute(
+                f"""
+                SELECT * FROM discovered_sources{where}
+                ORDER BY discovered_at, source_id
+                """,
+                parameters,
+            ).fetchall()
+
+    def update_discovered_source(
+        self,
+        source_id: str,
+        *,
+        status: str,
+        content_hash: str | None = None,
+        document_id: str | None = None,
+        error_type: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        """Record ingestion success, unchanged content, or a sanitized failure."""
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE discovered_sources
+                SET status = ?, content_hash = COALESCE(?, content_hash),
+                    document_id = COALESCE(?, document_id), error_type = ?,
+                    error_message = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE source_id = ?
+                """,
+                (
+                    status,
+                    content_hash,
+                    document_id,
+                    error_type,
+                    error_message,
+                    source_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Unknown discovered source: {source_id}")
 
     def find_document_by_hash(self, agency_id: str, file_hash: str) -> sqlite3.Row | None:
         """Look for exact source content already stored for one agency.
@@ -745,7 +1335,7 @@ class SQLiteStore:
 
     def refresh_document_metadata(
         self, document_id: str, metadata: DocumentMetadata
-    ) -> None:
+    ) -> bool:
         """Replace reviewed descriptive metadata without changing chunk IDs.
 
         This method supports correction of an already-ingested synthetic file
@@ -755,7 +1345,34 @@ class SQLiteStore:
         """
         if metadata.capture_date is None:
             raise ValueError("capture_date is required when refreshing metadata")
+        changed = False
         with self.connect() as connection:
+            current = connection.execute(
+                "SELECT * FROM documents WHERE document_id = ?", (document_id,)
+            ).fetchone()
+            if current is None:
+                raise ValueError(f"Unknown document_id: {document_id}")
+            new_values = (
+                metadata.title,
+                metadata.document_type,
+                metadata.source_url,
+                _iso(metadata.publication_date),
+                _iso(metadata.effective_date),
+                _iso(metadata.last_updated_date),
+                metadata.capture_date.isoformat(),
+                json.dumps(metadata.extra_metadata, sort_keys=True),
+            )
+            old_values = (
+                current["title"],
+                current["document_type"],
+                current["source_url"],
+                current["publication_date"],
+                current["effective_date"],
+                current["last_updated_date"],
+                current["capture_date"],
+                current["metadata_json"],
+            )
+            changed = new_values != old_values
             cursor = connection.execute(
                 """
                 UPDATE documents
@@ -765,14 +1382,7 @@ class SQLiteStore:
                 WHERE document_id = ?
                 """,
                 (
-                    metadata.title,
-                    metadata.document_type,
-                    metadata.source_url,
-                    _iso(metadata.publication_date),
-                    _iso(metadata.effective_date),
-                    _iso(metadata.last_updated_date),
-                    metadata.capture_date.isoformat(),
-                    json.dumps(metadata.extra_metadata, sort_keys=True),
+                    *new_values,
                     document_id,
                 ),
             )
@@ -786,6 +1396,75 @@ class SQLiteStore:
                 """,
                 (metadata.agency_name, metadata.agency_id),
             )
+        if changed:
+            # vec0 duplicates type/date metadata for pre-KNN filtering. Removing
+            # only this document's rows lets the normal incremental indexer
+            # restore them with corrected metadata; unrelated vectors remain.
+            self.invalidate_document_embeddings((document_id,))
+        return changed
+
+    def refresh_discovered_source_metadata(
+        self,
+        document_id: str,
+        *,
+        title: str,
+        document_type: str,
+        publication_date: date | None,
+        effective_date: date | None,
+        last_updated_date: date | None,
+    ) -> None:
+        """Keep the discovery ledger aligned with reviewed document metadata."""
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE discovered_sources
+                SET title = ?, document_type = ?, publication_date = ?,
+                    effective_date = ?, last_updated_date = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE document_id = ?
+                """,
+                (
+                    title,
+                    document_type,
+                    _iso(publication_date),
+                    _iso(effective_date),
+                    _iso(last_updated_date),
+                    document_id,
+                ),
+            )
+
+    def invalidate_document_embeddings(self, document_ids: Sequence[str]) -> int:
+        """Delete vector rows whose duplicated filter metadata became stale.
+
+        Chunk text and relational provenance remain untouched. The next normal
+        ``VectorIndexer.sync`` call recreates only these rows, which is safer
+        than leaving an old document type or evidence date inside sqlite-vec.
+        """
+        ids = [value for value in document_ids if value]
+        if not ids:
+            return 0
+        with self.connect() as connection:
+            table_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'chunk_embeddings'"
+            ).fetchone()
+            if not table_exists:
+                return 0
+            placeholders = ", ".join("?" for _ in ids)
+            chunk_ids = [
+                row["chunk_id"]
+                for row in connection.execute(
+                    f"SELECT chunk_id FROM chunks WHERE document_id IN ({placeholders})",
+                    ids,
+                )
+            ]
+        if not chunk_ids:
+            return 0
+        with self.vector_connect() as connection:
+            connection.executemany(
+                "DELETE FROM chunk_embeddings WHERE chunk_id = ?",
+                [(chunk_id,) for chunk_id in chunk_ids],
+            )
+        return len(chunk_ids)
 
     def copy_documents_to(
         self, target: "SQLiteStore", document_ids: Sequence[str]
@@ -947,6 +1626,13 @@ def _iso(value: object) -> str | None:
     document INSERT parameter list.
     """
     return value.isoformat() if value is not None else None
+
+
+def _iso_value(value: object) -> str | None:
+    """Serialize optional discovery dates supplied as date objects or ISO text."""
+    if value is None:
+        return None
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
 
 def _parse_stored_date(value: str | None) -> date | None:

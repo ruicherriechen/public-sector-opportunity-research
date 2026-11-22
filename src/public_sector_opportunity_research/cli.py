@@ -8,12 +8,14 @@ and metadata validation. Users reach it through ``__main__.py`` with
 
 Before this module runs, Python has only loaded the package entry point. The CLI
 then parses arguments, loads ``Settings``, initializes ``SQLiteStore``, and
-constructs only the ingestion, semantic-retrieval, opportunity-assessment, or
-offline LangGraph services needed by the selected command. After work completes, it prints a
-human-readable result and returns a process exit code.
+constructs only the ingestion, bounded official-source, semantic-retrieval,
+opportunity-assessment, or LangGraph services needed by the selected command.
+After work completes, it prints a human-readable result and returns a process
+exit code.
 
-The CLI intentionally contains composition and presentation, not parsing or
-SQL details. LangGraph workflow orchestration remains in ``agents/graph.py``.
+The CLI intentionally contains composition and presentation, not parsing, HTTP
+safety, or SQL details. LangGraph orchestration remains in ``agents/graph.py``
+and deterministic public-source research remains in the three ``web_*`` modules.
 This keeps core modules reusable by future agents or another user interface
 without copying command-line logic.
 """
@@ -22,10 +24,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
+from datetime import date, timedelta
 from pathlib import Path
 
 from .agents.graph import run_offline_research_graph
 from .agents.rag_service import RAGResearchService
+from .agents.research_manager import RESEARCH_DOCUMENT_TYPES, plan_source_discovery
 from .assessment import AssessmentError
 from .chunking import SectionChunker
 from .config import Settings
@@ -36,14 +41,28 @@ from .demonstration import (
 )
 from .embeddings import CrossEncoderReranker, SentenceTransformerEmbedder
 from .evaluation import run_retrieval_evaluation
+from .feedback_followup import run_targeted_followup
 from .indexing import VectorIndexer
 from .human_review import import_human_reviews
 from .ingestion import DocumentIngestor
 from .models import DocumentMetadata
 from .retrieval import SemanticRetriever
+from .review_service import relevant_feedback_guidance
 from .storage import SQLiteStore
 from .submission import build_capstone_submission
 from .synthetic_demo import prepare_synthetic_demo
+from .web_fetching import SafeWebFetcher
+from .web_research import (
+    discover_sources,
+    ingest_discovered_sources,
+    refresh_existing_agency_metadata,
+)
+from .web_sources import (
+    BraveSearchProvider,
+    DiscoveryLimits,
+    GovernmentWebsiteAdapter,
+    USAspendingAdapter,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -207,17 +226,61 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review.add_argument("--input", type=Path, required=True)
 
-    # The offline graph composes the existing local RAG stack with deterministic
-    # placeholders. It never constructs an OpenAI client or performs web search.
+    # Mock is the safe default. Live adapters are constructed only for stages
+    # explicitly routed to OpenAI or Codex.
     graph = commands.add_parser(
         "run-agent-graph",
-        help="Run the offline LangGraph multi-agent foundation",
+        help="Run LangGraph (mock default; OpenAI/Codex are explicit opt-ins)",
     )
     graph.add_argument("--agency-id", required=True)
     graph.add_argument("--objective", required=True)
+    graph.add_argument(
+        "--opportunity-id",
+        help="Stable opportunity identity used for exact prior-feedback matching",
+    )
     graph.add_argument("--as-of-date")
     graph.add_argument("--freshness-cutoff-date")
     graph.add_argument("--max-iterations", type=int)
+    graph.add_argument("--max-agent-calls", type=int)
+    graph.add_argument(
+        "--max-agent-input-tokens",
+        type=int,
+        help=(
+            "Workflow-wide input-token limit; default 50000 or "
+            "LANGGRAPH_MAX_INPUT_TOKENS"
+        ),
+    )
+    graph.add_argument(
+        "--max-agent-output-tokens",
+        type=int,
+        help=(
+            "Workflow-wide output-token limit; default 6000 or "
+            "LANGGRAPH_MAX_OUTPUT_TOKENS"
+        ),
+    )
+    graph.add_argument(
+        "--procurement-context-tokens",
+        type=int,
+        help=(
+            "Procurement evidence allowance (2000-4000 estimated tokens); "
+            "default comes from PROCUREMENT_CONTEXT_TOKENS"
+        ),
+    )
+    graph.add_argument("--strategy-context-tokens", type=int,
+        help="Strategy evidence allowance (2000-4000 estimated tokens); default comes from STRATEGY_CONTEXT_TOKENS")
+    graph.add_argument(
+        "--model-provider",
+        choices=("mock", "openai", "codex"),
+        default=None,
+        help="Global provider; defaults to AGENT_MODEL_PROVIDER, then mock",
+    )
+    graph.add_argument("--strategy-provider", choices=("mock", "openai", "codex"))
+    graph.add_argument("--procurement-provider", choices=("mock", "openai", "codex"))
+    graph.add_argument("--synthesis-provider", choices=("mock", "openai", "codex"))
+    graph.add_argument(
+        "--agent-model",
+        help="Model override for the globally selected live provider",
+    )
     graph.add_argument("--thread-id")
     graph.add_argument(
         "--checkpoint-db",
@@ -230,7 +293,142 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("outputs/langgraph_offline_result.json"),
     )
     graph.add_argument("--overwrite", action="store_true")
+
+    followup = commands.add_parser(
+        "run-feedback-followup",
+        help="Run one bounded local research cycle from saved disagreement feedback",
+    )
+    followup.add_argument("--feedback-id", required=True)
+    followup.add_argument(
+        "--model-provider", choices=("mock", "openai", "codex"), default="mock"
+    )
+    followup.add_argument("--allow-paid-model", action="store_true")
+    followup.add_argument("--checkpoint-db", type=Path)
+    followup.add_argument("--output-dir", type=Path, default=Path("outputs"))
+
+    discover = commands.add_parser(
+        "discover-sources",
+        help="Discover bounded official .gov and USAspending source candidates",
+    )
+    _add_agency_discovery_arguments(discover)
+    discover.add_argument("--category", action="append", choices=RESEARCH_DOCUMENT_TYPES)
+    discover.add_argument("--dry-run", action="store_true")
+    discover.add_argument("--preview", action="store_true")
+    discover.add_argument("--allow-live-fetch", action="store_true")
+    discover.add_argument(
+        "--output", type=Path, default=Path("outputs/source_discovery.json")
+    )
+    discover.add_argument("--overwrite", action="store_true")
+
+    ingest_discovered = commands.add_parser(
+        "ingest-discovered",
+        help="Verify and ingest previously discovered official sources",
+    )
+    ingest_discovered.add_argument("--agency-id", required=True)
+    ingest_discovered.add_argument("--official-domain", required=True)
+    ingest_discovered.add_argument("--run-id")
+    ingest_discovered.add_argument("--source-id", action="append", default=[])
+    ingest_discovered.add_argument("--dry-run", action="store_true")
+    ingest_discovered.add_argument("--preview", action="store_true")
+    ingest_discovered.add_argument("--allow-live-fetch", action="store_true")
+
+    refresh_metadata = commands.add_parser(
+        "refresh-evidence-metadata",
+        help="Reclassify stored agency evidence and fill only explicit source dates",
+    )
+    refresh_metadata.add_argument("--agency-id", required=True)
+    refresh_metadata.add_argument(
+        "--preview",
+        action="store_true",
+        help="Print each changed type/date after the offline refresh",
+    )
+
+    research_agency = commands.add_parser(
+        "research-agency",
+        help="Refresh official evidence when needed, index it, then run LangGraph",
+    )
+    _add_agency_discovery_arguments(research_agency)
+    research_agency.add_argument("--freshness-days", type=int)
+    research_agency.add_argument("--dry-run", action="store_true")
+    research_agency.add_argument("--preview", action="store_true")
+    research_agency.add_argument("--allow-live-fetch", action="store_true")
+    research_agency.add_argument(
+        "--model-provider", choices=("mock", "openai", "codex"), default=None
+    )
+    research_agency.add_argument("--strategy-provider", choices=("mock", "openai", "codex"))
+    research_agency.add_argument("--procurement-provider", choices=("mock", "openai", "codex"))
+    research_agency.add_argument("--synthesis-provider", choices=("mock", "openai", "codex"))
+    research_agency.add_argument("--allow-paid-model", action="store_true")
+    research_agency.add_argument(
+        "--opportunity-id",
+        help="Stable opportunity identity used for exact prior-feedback matching",
+    )
+    research_agency.add_argument("--agent-model")
+    research_agency.add_argument("--max-iterations", type=int)
+    research_agency.add_argument("--max-agent-calls", type=int)
+    research_agency.add_argument(
+        "--max-agent-input-tokens",
+        type=int,
+        help=(
+            "Workflow-wide input-token limit; default 50000 or "
+            "LANGGRAPH_MAX_INPUT_TOKENS"
+        ),
+    )
+    research_agency.add_argument(
+        "--max-agent-output-tokens",
+        type=int,
+        help=(
+            "Workflow-wide output-token limit; default 6000 or "
+            "LANGGRAPH_MAX_OUTPUT_TOKENS"
+        ),
+    )
+    research_agency.add_argument("--procurement-context-tokens", type=int)
+    research_agency.add_argument("--strategy-context-tokens", type=int)
+    research_agency.add_argument("--checkpoint-db", type=Path)
+    research_agency.add_argument(
+        "--output", type=Path, default=Path("outputs/real_agency_research.json")
+    )
+    research_agency.add_argument("--overwrite", action="store_true")
+
+    # This is the only diagnostic command that may make a live provider call.
+    # It is deliberately separate from LangGraph/RAG and must be selected by
+    # name, preventing normal mock or offline commands from contacting OpenAI.
+    diagnostic = commands.add_parser(
+        "diagnose-openai-structured",
+        help="Make one tiny opt-in LangChain/OpenAI Structured Outputs request",
+    )
+    diagnostic.add_argument(
+        "--model",
+        help="OpenAI model override; otherwise uses OPENAI_AGENT_MODEL",
+    )
+    codex_ready = commands.add_parser(
+        "check-codex-readiness",
+        help="Check Codex runtime/login/sandbox startup without model inference",
+    )
+    codex_diagnostic = commands.add_parser(
+        "diagnose-codex-structured",
+        help="Make one explicit bounded Codex structured-output inference",
+    )
+    codex_diagnostic.add_argument("--model")
+    codex_diagnostic.add_argument(
+        "--allow-inference",
+        action="store_true",
+        help="Acknowledge that this consumes one Codex subscription-backed call",
+    )
     return parser
+
+
+def _add_agency_discovery_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the shared, explicit real-agency discovery arguments to a command."""
+    parser.add_argument("--agency-id", required=True)
+    parser.add_argument("--agency-name", required=True)
+    parser.add_argument("--official-domain", required=True)
+    parser.add_argument("--objective", required=True)
+    parser.add_argument("--start-date")
+    parser.add_argument("--end-date")
+    parser.add_argument("--seed-url", action="append", default=[])
+    parser.add_argument("--max-searches", type=int)
+    parser.add_argument("--max-urls", type=int)
 
 
 def _build_semantic_services(
@@ -255,6 +453,108 @@ def _build_semantic_services(
     )
     indexer = VectorIndexer(store, embedder)
     return indexer, SemanticRetriever(store, embedder, reranker, indexer)
+
+
+def _web_limits(settings: Settings, args: argparse.Namespace) -> DiscoveryLimits:
+    """Combine environment defaults with the command's narrow limit overrides."""
+    max_searches = getattr(args, "max_searches", None)
+    max_urls = getattr(args, "max_urls", None)
+    return DiscoveryLimits(
+        max_searches=(
+            max_searches if max_searches is not None else settings.web_max_searches
+        ),
+        max_urls=max_urls if max_urls is not None else settings.web_max_urls,
+        max_document_bytes=settings.web_max_document_bytes,
+        max_total_bytes=settings.web_max_total_bytes,
+        max_runtime_seconds=settings.web_max_runtime_seconds,
+        max_retries=settings.web_max_retries,
+        max_redirects=settings.web_max_redirects,
+    )
+
+
+def _discovery_dates(args: argparse.Namespace) -> tuple[date, date]:
+    """Return an explicit/default three-year official-award search window."""
+    end = parse_iso_date(getattr(args, "end_date", None)) or date.today()
+    start = parse_iso_date(getattr(args, "start_date", None)) or end - timedelta(
+        days=3 * 365
+    )
+    if start > end:
+        raise SystemExit("--start-date cannot follow --end-date")
+    return start, end
+
+
+def _web_adapters(settings: Settings):
+    """Construct source adapters without contacting their remote services."""
+    search = BraveSearchProvider(
+        settings.brave_search_api_key,
+        timeout_seconds=settings.http_timeout_seconds,
+        max_retries=settings.web_max_retries,
+    )
+    return GovernmentWebsiteAdapter(search), USAspendingAdapter(
+        timeout_seconds=settings.http_timeout_seconds,
+        max_retries=settings.web_max_retries,
+    )
+
+
+def usable_research_evidence(
+    store: SQLiteStore, agency_id: str
+) -> tuple[bool, dict[str, object]]:
+    """Return whether an agency has documents, chunks, vectors, and a research type.
+
+    This deterministic gate runs after indexing and before LangGraph creates a
+    model adapter. It therefore protects individual, bulk, and future scheduled
+    jobs that all use the same ``research-agency`` command.
+    """
+
+    inventory = store.evidence_inventory(agency_id)
+    relevant_categories = set(inventory["categories"]) & set(
+        RESEARCH_DOCUMENT_TYPES
+    )
+    usable = (
+        int(inventory["documents"]) > 0
+        and int(inventory["chunks"]) > 0
+        and int(inventory["vectors"]) > 0
+        and bool(relevant_categories)
+    )
+    return usable, inventory
+
+
+def _json_date(value: object) -> str:
+    """Serialize dates in CLI audit reports while rejecting unknown objects."""
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _provider_selection(args, settings: Settings) -> dict[str, str]:
+    """Resolve stage override, global setting, then the safe mock default."""
+    global_provider = (args.model_provider or settings.model_provider or "mock").lower()
+    allowed = {"mock", "openai", "codex"}
+    selected = {
+        "global": global_provider,
+        "strategy": (
+            getattr(args, "strategy_provider", None)
+            or settings.strategy_model_provider
+            or global_provider
+        ).lower(),
+        "procurement": (
+            getattr(args, "procurement_provider", None)
+            or settings.procurement_model_provider
+            or global_provider
+        ).lower(),
+        "synthesis": (
+            getattr(args, "synthesis_provider", None)
+            or settings.synthesis_model_provider
+            or global_provider
+        ).lower(),
+    }
+    invalid = sorted(set(selected.values()) - allowed)
+    if invalid:
+        raise SystemExit(
+            "Model providers must be mock, openai, or codex; invalid: "
+            + ", ".join(invalid)
+        )
+    return selected
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -282,6 +582,68 @@ def main(argv: list[str] | None = None) -> int:
 
     # Environment settings supply defaults; the explicit --db option wins.
     settings = Settings.from_env()
+
+    if args.command == "diagnose-openai-structured":
+        # Import lazily so every other command remains independent of this live
+        # diagnostic. It does not initialize SQLite or load BGE/MiniLM models.
+        from .agents.openai_model import (
+            StructuredModelOutputError,
+            StructuredModelProviderError,
+        )
+        from .openai_diagnostic import run_openai_structured_diagnostic
+
+        model_name = args.model or settings.openai_agent_model
+        try:
+            result = run_openai_structured_diagnostic(model_name=model_name)
+        except (StructuredModelProviderError, StructuredModelOutputError) as exc:
+            # ``SystemExit`` prints only the already-sanitized summary and
+            # suppresses request-bearing third-party tracebacks.
+            raise SystemExit(str(exc)) from None
+        print(
+            "OpenAI structured diagnostic succeeded | "
+            f"model={model_name} | status={result.status} | "
+            "max_output_tokens=128 | retries=0 | reasoning_effort=none"
+        )
+        return 0
+
+    if args.command == "check-codex-readiness":
+        # This starts the local transport and a secure empty thread only. It
+        # deliberately submits no turn, consumes no inference, and reads no
+        # credential file contents.
+        from .agents.codex_model import codex_readiness
+
+        try:
+            readiness = codex_readiness()
+        except Exception as exc:
+            raise SystemExit(
+                f"Codex readiness failed (category={type(exc).__name__})"
+            ) from None
+        print(json.dumps(readiness, indent=2, sort_keys=True))
+        return 0
+
+    if args.command == "diagnose-codex-structured":
+        if not args.allow_inference:
+            raise SystemExit(
+                "Codex diagnostic requires --allow-inference because it submits "
+                "one subscription-backed model turn."
+            )
+        from .codex_diagnostic import run_codex_structured_diagnostic
+
+        invocation = run_codex_structured_diagnostic(
+            model_name=args.model or settings.codex_agent_model,
+            timeout_seconds=min(settings.codex_timeout_seconds, 120),
+        )
+        print(
+            "Codex structured diagnostic succeeded | "
+            f"provider={invocation.call.provider} | "
+            f"model={invocation.call.model_name} | "
+            f"findings={len(invocation.output.findings)} | "
+            f"input_tokens={invocation.call.input_tokens} | "
+            f"output_tokens={invocation.call.output_tokens} | "
+            f"usage={invocation.call.usage_source}"
+        )
+        return 0
+
     store = SQLiteStore(args.db or settings.database_path)
 
     # ``init-db`` performs only schema creation and exits immediately.
@@ -292,6 +654,326 @@ def main(argv: list[str] | None = None) -> int:
 
     # Make all other commands beginner-friendly on a fresh database.
     store.initialize()
+
+    if args.command == "discover-sources":
+        if not args.dry_run and not args.allow_live_fetch:
+            raise SystemExit(
+                "Live discovery is disabled. Add --allow-live-fetch or use --dry-run."
+            )
+        if not args.dry_run and args.output.exists() and not args.overwrite:
+            raise SystemExit(
+                f"Output already exists: {args.output}. Add --overwrite to replace it."
+            )
+        limits = _web_limits(settings, args)
+        start, end = _discovery_dates(args)
+        categories = args.category or list(RESEARCH_DOCUMENT_TYPES)
+        website, usaspending = _web_adapters(settings)
+        outcome = discover_sources(
+            store=store,
+            website_adapter=website,
+            usaspending_adapter=usaspending,
+            agency_id=args.agency_id,
+            agency_name=args.agency_name,
+            official_domain=args.official_domain,
+            objective=args.objective,
+            categories=categories,
+            start_date=start,
+            end_date=end,
+            limits=limits,
+            seed_urls=args.seed_url,
+            dry_run=args.dry_run,
+        )
+        if args.dry_run:
+            print(
+                "Discovery dry run | no network or evidence/discovery writes | "
+                f"categories={','.join(categories)} | searches<={limits.max_searches} "
+                f"| urls<={limits.max_urls} | dates={start}..{end}"
+            )
+            return 0
+        report = {
+            "run_id": outcome.run_id,
+            "agency_id": args.agency_id,
+            "objective": args.objective,
+            "sources": [asdict(item) for item in outcome.sources],
+            "failures": [asdict(item) for item in outcome.failures],
+            "warning": "Incomplete discovery is not proof that no source or award exists.",
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(report, indent=2, default=_json_date) + "\n", encoding="utf-8"
+        )
+        print(
+            f"Discovery complete | run={outcome.run_id} | "
+            f"candidates={len(outcome.sources)} | gaps={len(outcome.failures)}"
+        )
+        if args.preview:
+            for source in outcome.sources:
+                print(
+                    f"{source.source_id} | {source.adapter} | {source.document_type} "
+                    f"| {source.title} | {source.canonical_url}"
+                )
+            for failure in outcome.failures:
+                print(
+                    f"GAP | {failure.adapter} | {failure.category} | "
+                    f"{failure.error_type}: {failure.message}"
+                )
+        print(f"Discovery report: {args.output}")
+        return 0
+
+    if args.command == "ingest-discovered":
+        if not args.dry_run and not args.allow_live_fetch:
+            raise SystemExit(
+                "Discovered-source ingestion is disabled. Add --allow-live-fetch "
+                "or use --dry-run."
+            )
+        limits = _web_limits(settings, args)
+        ingestor = DocumentIngestor(
+            store,
+            SectionChunker(
+                settings.chunk_target_tokens,
+                settings.chunk_max_tokens,
+                settings.chunk_overlap_tokens,
+            ),
+            settings.http_timeout_seconds,
+        )
+        outcomes = ingest_discovered_sources(
+            store=store,
+            ingestor=ingestor,
+            fetcher=SafeWebFetcher(limits, timeout_seconds=settings.http_timeout_seconds),
+            agency_id=args.agency_id,
+            official_domain=args.official_domain,
+            run_id=args.run_id,
+            source_ids=args.source_id,
+            dry_run=args.dry_run,
+        )
+        print(
+            f"Discovered-source {'preview' if args.dry_run else 'ingestion'} | "
+            f"selected={len(outcomes)}"
+        )
+        if args.preview or args.dry_run:
+            for outcome in outcomes:
+                print(
+                    f"{outcome.source_id} | {outcome.status} | "
+                    f"document={outcome.document_id or '-'} "
+                    f"| error={outcome.error_type or '-'}"
+                )
+        failed = sum(item.status == "failed" for item in outcomes)
+        print(
+            f"ingested={sum(item.status == 'ingested' for item in outcomes)} "
+            f"| unchanged={sum(item.status == 'unchanged' for item in outcomes)} "
+            f"| failed={failed}"
+        )
+        return 0
+
+    if args.command == "refresh-evidence-metadata":
+        outcomes = refresh_existing_agency_metadata(
+            store, agency_id=args.agency_id
+        )
+        changed = [item for item in outcomes if item.changed]
+        print(
+            f"Offline metadata refresh | agency={args.agency_id} "
+            f"| documents={len(outcomes)} | changed={len(changed)}"
+        )
+        if args.preview:
+            for item in outcomes:
+                print(
+                    f"{item.document_id} | {item.old_document_type} -> "
+                    f"{item.new_document_type} | publication="
+                    f"{item.publication_date or 'unknown'} | effective="
+                    f"{item.effective_date or 'unknown'} | updated="
+                    f"{item.last_updated_date or 'unknown'}"
+                )
+        if changed:
+            print(
+                "Changed vector filter rows were invalidated. Run "
+                "index-embeddings to restore only those vectors."
+            )
+        return 0
+
+    if args.command == "research-agency":
+        providers = _provider_selection(args, settings)
+        freshness_days = (
+            args.freshness_days
+            if args.freshness_days is not None
+            else settings.web_freshness_days
+        )
+        plan = plan_source_discovery(
+            store,
+            agency_id=args.agency_id,
+            max_age_days=freshness_days,
+        )
+        print(
+            f"Research Manager evidence check | missing={','.join(plan.missing_categories) or '-'} "
+            f"| stale={','.join(plan.stale_categories) or '-'} "
+            f"| current={','.join(plan.current_categories) or '-'}"
+        )
+        if args.dry_run:
+            print(
+                "Research dry run | no network, evidence, embedding, or model writes | "
+                f"would_discover={','.join(plan.categories_to_discover) or '-'}"
+            )
+            return 0
+        if "openai" in providers.values() and not args.allow_paid_model:
+            raise SystemExit(
+                "OpenAI execution requires both --model-provider openai and "
+                "--allow-paid-model."
+            )
+        if args.output.exists() and not args.overwrite:
+            raise SystemExit(
+                f"Output already exists: {args.output}. Add --overwrite to replace it."
+            )
+        if plan.categories_to_discover:
+            if not args.allow_live_fetch:
+                print(
+                    "Live refresh skipped because --allow-live-fetch was not supplied; "
+                    "coverage gaps remain and do not prove source absence."
+                )
+            else:
+                limits = _web_limits(settings, args)
+                start, end = _discovery_dates(args)
+                website, usaspending = _web_adapters(settings)
+                discovery = discover_sources(
+                    store=store,
+                    website_adapter=website,
+                    usaspending_adapter=usaspending,
+                    agency_id=args.agency_id,
+                    agency_name=args.agency_name,
+                    official_domain=args.official_domain,
+                    objective=args.objective,
+                    categories=plan.categories_to_discover,
+                    start_date=start,
+                    end_date=end,
+                    limits=limits,
+                    seed_urls=args.seed_url,
+                )
+                ingestor = DocumentIngestor(
+                    store,
+                    SectionChunker(
+                        settings.chunk_target_tokens,
+                        settings.chunk_max_tokens,
+                        settings.chunk_overlap_tokens,
+                    ),
+                    settings.http_timeout_seconds,
+                )
+                ingestion_outcomes = ingest_discovered_sources(
+                    store=store,
+                    ingestor=ingestor,
+                    fetcher=SafeWebFetcher(
+                        limits, timeout_seconds=settings.http_timeout_seconds
+                    ),
+                    agency_id=args.agency_id,
+                    official_domain=args.official_domain,
+                    run_id=discovery.run_id,
+                )
+                print(
+                    f"Automatic refresh | discovered={len(discovery.sources)} "
+                    f"| ingested={sum(item.status == 'ingested' for item in ingestion_outcomes)} "
+                    f"| unchanged={sum(item.status == 'unchanged' for item in ingestion_outcomes)} "
+                    f"| failed={sum(item.status == 'failed' for item in ingestion_outcomes)}"
+                )
+
+        indexer, retriever = _build_semantic_services(settings, store)
+        sync = indexer.sync()
+        print(
+            f"Vector refresh | embedded_now={sync.embedded_count} "
+            f"| total_vectors={sync.existing_count}"
+        )
+        evidence_ready, inventory = usable_research_evidence(
+            store, args.agency_id
+        )
+        if not evidence_ready:
+            print(
+                "Research stopped: no usable agency evidence was found. "
+                "No model calls were made."
+            )
+            return 2
+        result = run_offline_research_graph(
+            service=RAGResearchService(retriever),
+            agency_id=args.agency_id,
+            objective=args.objective,
+            checkpoint_path=args.checkpoint_db or settings.langgraph_checkpoint_path,
+            max_iterations=(
+                args.max_iterations
+                if args.max_iterations is not None
+                else settings.langgraph_max_iterations
+            ),
+            freshness_cutoff_date=plan.freshness_cutoff.isoformat(),
+            max_agent_calls=(
+                args.max_agent_calls
+                if args.max_agent_calls is not None
+                else settings.langgraph_max_agent_calls
+            ),
+            max_agent_input_tokens=(
+                args.max_agent_input_tokens
+                if args.max_agent_input_tokens is not None
+                else settings.langgraph_max_input_tokens
+            ),
+            max_agent_output_tokens=(
+                args.max_agent_output_tokens
+                if args.max_agent_output_tokens is not None
+                else settings.langgraph_max_output_tokens
+            ),
+            procurement_context_tokens=(
+                args.procurement_context_tokens
+                if args.procurement_context_tokens is not None
+                else settings.procurement_context_tokens
+            ),
+            strategy_context_tokens=(args.strategy_context_tokens if args.strategy_context_tokens is not None else settings.strategy_context_tokens),
+            model_provider=providers["global"],
+            model_name=(
+                args.agent_model
+                if providers["global"] == "openai" and args.agent_model
+                else settings.openai_agent_model
+            ),
+            codex_model_name=(
+                args.agent_model
+                if providers["global"] == "codex" and args.agent_model
+                else settings.codex_agent_model
+            ),
+            strategy_provider=providers["strategy"],
+            procurement_provider=providers["procurement"],
+            synthesis_provider=providers["synthesis"],
+            codex_timeout_seconds=settings.codex_timeout_seconds,
+            codex_reasoning_effort=settings.codex_reasoning_effort,
+            prior_human_feedback=[
+                item.model_dump(mode="json")
+                for item in relevant_feedback_guidance(
+                    store,
+                    agency_id=args.agency_id,
+                    objective=args.objective,
+                    opportunity_id=args.opportunity_id,
+                )
+            ],
+        )
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(result.model_dump(mode="json"), indent=2) + "\n",
+            encoding="utf-8",
+        )
+        print(
+            f"Agency research complete | status={result.status} | "
+            f"provider={result.model_provider} | output={args.output}"
+        )
+        return 0
+
+    if args.command == "run-feedback-followup":
+        outcome = run_targeted_followup(
+            store=store,
+            feedback_id=args.feedback_id,
+            output_directory=args.output_dir,
+            checkpoint_path=(
+                args.checkpoint_db or settings.langgraph_checkpoint_path
+            ),
+            model_provider=args.model_provider,
+            allow_paid_model=args.allow_paid_model,
+            settings=settings,
+        )
+        print(
+            "Targeted follow-up complete | "
+            f"status={outcome.result.status} | thread={outcome.result.thread_id} "
+            f"| output={outcome.output_path}"
+        )
+        return 0
 
     if args.command == "ingest":
         # Extra metadata is accepted as JSON but must be an object/key-value map.
@@ -453,6 +1135,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run-agent-graph":
+        providers = _provider_selection(args, settings)
         # Refuse accidental report replacement before model loading or retrieval.
         if args.output.exists() and not args.overwrite:
             raise SystemExit(
@@ -474,6 +1157,52 @@ def main(argv: list[str] | None = None) -> int:
             thread_id=args.thread_id,
             as_of_date=args.as_of_date,
             freshness_cutoff_date=args.freshness_cutoff_date,
+            max_agent_calls=(
+                args.max_agent_calls
+                if args.max_agent_calls is not None
+                else settings.langgraph_max_agent_calls
+            ),
+            max_agent_input_tokens=(
+                args.max_agent_input_tokens
+                if args.max_agent_input_tokens is not None
+                else settings.langgraph_max_input_tokens
+            ),
+            max_agent_output_tokens=(
+                args.max_agent_output_tokens
+                if args.max_agent_output_tokens is not None
+                else settings.langgraph_max_output_tokens
+            ),
+            procurement_context_tokens=(
+                args.procurement_context_tokens
+                if args.procurement_context_tokens is not None
+                else settings.procurement_context_tokens
+            ),
+            strategy_context_tokens=(args.strategy_context_tokens if args.strategy_context_tokens is not None else settings.strategy_context_tokens),
+            model_provider=providers["global"],
+            model_name=(
+                args.agent_model
+                if providers["global"] == "openai" and args.agent_model
+                else settings.openai_agent_model
+            ),
+            codex_model_name=(
+                args.agent_model
+                if providers["global"] == "codex" and args.agent_model
+                else settings.codex_agent_model
+            ),
+            strategy_provider=providers["strategy"],
+            procurement_provider=providers["procurement"],
+            synthesis_provider=providers["synthesis"],
+            codex_timeout_seconds=settings.codex_timeout_seconds,
+            codex_reasoning_effort=settings.codex_reasoning_effort,
+            prior_human_feedback=[
+                item.model_dump(mode="json")
+                for item in relevant_feedback_guidance(
+                    store,
+                    agency_id=args.agency_id,
+                    objective=args.objective,
+                    opportunity_id=args.opportunity_id,
+                )
+            ],
         )
         # Save the same schema-validated structure printed in the concise summary.
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -482,19 +1211,32 @@ def main(argv: list[str] | None = None) -> int:
             encoding="utf-8",
         )
         print(
-            f"Offline LangGraph run | status={result.status} "
+            f"LangGraph run | provider={result.model_provider} | status={result.status} "
             f"| iterations={result.iterations_completed} "
             f"| thread={result.thread_id}"
         )
         for output in result.researcher_outputs:
             print(
                 f"{output.role} iteration {output.iteration} | "
-                f"evidence={len(output.evidence)} "
+                f"evidence={len(output.evidence)} | findings={len(output.findings)} "
                 f"| missing={','.join(output.missing_categories) or '-'}"
             )
         print(
             f"Retrieval traces={len(result.retrieval_trace_ids)} "
             f"| final evidence={len(result.synthesis.evidence)}"
+        )
+        for opportunity in result.synthesis.opportunities:
+            print(
+                f"Opportunity #{opportunity.rank} | status={opportunity.status} "
+                f"| actionable={opportunity.commercially_actionable} "
+                f"| score={opportunity.score.total}/12 | {opportunity.title}"
+            )
+        print(
+            f"Model budget | calls={result.budget.calls_used}/"
+            f"{result.budget.max_calls} | input_tokens="
+            f"{result.budget.input_tokens_used}/{result.budget.max_input_tokens} "
+            f"| output_tokens={result.budget.output_tokens_used}/"
+            f"{result.budget.max_output_tokens}"
         )
         print(result.placeholder_notice)
         print(f"Structured result: {args.output}")

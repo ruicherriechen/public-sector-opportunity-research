@@ -2,7 +2,8 @@
 
 This module is the ingestion orchestrator: it connects the otherwise independent
 RAG stages without implementing their internal details. ``cli.py`` supplies a
-``DocumentMetadata`` record and chooses either a local path or public PDF URL.
+``DocumentMetadata`` record and chooses a local path, direct PDF URL, or already
+verified PDF/text bytes from the bounded web-research layer.
 ``DocumentIngestor`` then uses ``ids.py`` for fingerprints/IDs, ``parsing.py``
 for text extraction, ``chunking.py`` for retrieval-sized units, and
 ``storage.py`` for duplicate checks and transactional persistence.
@@ -12,9 +13,10 @@ successful new ingestion, the database contains an agency, document metadata,
 and all chunks; the CLI receives an ``IngestionResult`` to display. Duplicate
 content returns early without parsing or writing again.
 
-Only direct PDF downloads are supported. This is not a crawler, and local PDF
-parsing does not provide OCR. Network, file-system, parsing, and SQLite errors
-are allowed to propagate so callers receive a truthful failure.
+Direct URL ingestion remains PDF-only; HTML acquisition and safety checks live
+in ``web_fetching.py`` and pass extracted text through ``ingest_bytes``. This is
+not a crawler, and PDF parsing does not provide OCR. Network, file-system,
+parsing, and SQLite errors propagate so callers receive a truthful failure.
 """
 
 from __future__ import annotations
@@ -28,8 +30,15 @@ from urllib.parse import urlparse
 import requests
 
 from .chunking import SectionChunker
+from .document_security import (
+    DocumentSafetyError,
+    prompt_injection_indicators,
+    redact_secret_like_text,
+    scan_file_with_local_antivirus,
+    validate_document_bytes,
+)
 from .ids import sha256_hex, stable_document_id
-from .models import DocumentMetadata, IngestionResult
+from .models import DocumentMetadata, IngestionResult, ParsedBlock
 from .parsing import parse_document
 from .storage import SQLiteStore
 
@@ -72,14 +81,22 @@ def validate_metadata_dates(metadata: DocumentMetadata) -> None:
         raise ValueError("capture_date cannot precede publication_date")
 
     if metadata.document_type == "confirmed-award":
+        # A structured USAspending record has a verified base obligation date
+        # but no separate publication date. Do not relabel capture or API
+        # modification time as publication merely to satisfy the local schema.
+        structured_award = bool(
+            metadata.extra_metadata.get("source_system") == "usaspending"
+            and metadata.extra_metadata.get("source_record_verified")
+        )
         required = {
-            "publication_date": publication,
             "effective_date": effective,
             "procurement_status": metadata.extra_metadata.get("procurement_status"),
             "contract_id": metadata.extra_metadata.get("contract_id"),
             "selected_vendor": metadata.extra_metadata.get("selected_vendor"),
             "execution_date": metadata.extra_metadata.get("execution_date"),
         }
+        if not structured_award:
+            required["publication_date"] = publication
         missing = sorted(name for name, value in required.items() if not value)
         if missing:
             raise ValueError(
@@ -96,6 +113,10 @@ def validate_metadata_dates(metadata: DocumentMetadata) -> None:
         if execution != effective:
             raise ValueError(
                 "confirmed-award effective_date must match execution_date for this MVP"
+            )
+        if structured_award and updated and updated < execution:
+            raise ValueError(
+                "USAspending last_updated_date cannot precede its base obligation date"
             )
         if publication and execution > publication:
             raise ValueError("execution_date cannot follow publication_date")
@@ -207,13 +228,54 @@ class DocumentIngestor:
             raise ValueError("URL response does not appear to be a PDF")
 
         # pypdf expects a local file; TemporaryDirectory cleans it up automatically.
-        with tempfile.TemporaryDirectory(prefix="opportunity-rag-") as temp_dir:
+        # Keep parser scratch files beside the configured database. This works
+        # in restricted Windows environments where the process-wide temporary
+        # directory may be readable but not writable.
+        temp_parent = self.store.database_path.parent
+        temp_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="opportunity-rag-", dir=temp_parent
+        ) as temp_dir:
             path = Path(temp_dir) / "download.pdf"
             path.write_bytes(content)
 
             # Frozen dataclasses are copied with ``replace`` instead of mutated.
             url_metadata = replace(metadata, source_url=metadata.source_url or url)
             return self._ingest(content, path, url_metadata, None)
+
+    def ingest_bytes(
+        self,
+        content: bytes,
+        suffix: str,
+        metadata: DocumentMetadata,
+    ) -> IngestionResult:
+        """Ingest already verified PDF or UTF-8 text bytes.
+
+        Args:
+            content: Exact downloaded/API-derived bytes used for hashing.
+            suffix: ``.pdf`` or ``.txt`` parser selection.
+            metadata: Verified source identity, dates, type, and provenance.
+
+        Returns:
+            The normal stable-ID and deduplication result.
+
+        Side effects and limitations:
+            Writes a temporary parser file and may write SQLite through the
+            existing common pipeline. Network access must happen before this
+            method in the bounded fetch layer. HTML must already be converted
+            to readable text; arbitrary HTML is never passed to the TXT parser.
+        """
+        normalized_suffix = suffix.casefold()
+        if normalized_suffix not in {".pdf", ".txt"}:
+            raise ValueError("ingest_bytes supports only .pdf or .txt content")
+        temp_parent = self.store.database_path.parent
+        temp_parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(
+            prefix="opportunity-rag-bytes-", dir=temp_parent
+        ) as temp_dir:
+            path = Path(temp_dir) / f"source{normalized_suffix}"
+            path.write_bytes(content)
+            return self._ingest(content, path, metadata, None)
 
     def _ingest(
         self,
@@ -245,6 +307,15 @@ class DocumentIngestor:
         The method assumes the store schema was initialized by the CLI. The
         duplicate check is exact-bytes rather than semantic similarity.
         """
+        # Validate bytes independently of their extension before any parser
+        # receives them. This blocks disguised executables, archives, binary
+        # payloads, and type/signature mismatches on every ingestion path.
+        byte_safety = validate_document_bytes(
+            content,
+            expected_suffix=parsing_path.suffix,
+        )
+        malware_scan = scan_file_with_local_antivirus(parsing_path)
+
         # Validate caller-supplied source metadata before deduplication. A
         # duplicate is still required to present coherent dates and status.
         validate_metadata_dates(metadata)
@@ -260,14 +331,50 @@ class DocumentIngestor:
             chunk_count = len(self.store.list_chunks(document_id=document_id, limit=1_000_000))
             return IngestionResult(document_id, file_hash, chunk_count, True)
 
-        # Parsing preserves source structure; chunking applies retrieval-size limits.
-        blocks = parse_document(parsing_path)
-        chunks = self.chunker.chunk(document_id, blocks)
+        # Parsing preserves source structure; deterministic post-parse limits
+        # prevent unusually complex documents from exhausting memory/context.
+        try:
+            blocks = parse_document(parsing_path)
+        except Exception as exc:
+            raise DocumentSafetyError(
+                f"document parser rejected malformed content ({type(exc).__name__})"
+            ) from None
+        _validate_parsed_document_limits(blocks)
+
+        # Source text is evidence, never an instruction channel. Keep useful
+        # suspicious prose, record narrow indicators, and redact recognizable
+        # credential shapes before any chunk reaches SQLite or a model prompt.
+        sanitized_blocks: list[ParsedBlock] = []
+        indicators = set(byte_safety.suspicious_indicators)
+        secret_categories: set[str] = set()
+        for block in blocks:
+            indicators.update(prompt_injection_indicators(block.text))
+            safe_text, redactions = redact_secret_like_text(block.text)
+            secret_categories.update(redactions)
+            sanitized_blocks.append(
+                ParsedBlock(safe_text, block.section_heading, block.page_number)
+            )
+
+        security_metadata = {
+            "validated": True,
+            "actual_content_type": byte_safety.actual_content_type,
+            "suspicious_indicators": sorted(indicators),
+            "secret_like_values_redacted": sorted(secret_categories),
+            "malware_scanner_available": malware_scan.available,
+            "malware_scan_status": malware_scan.status,
+        }
+        complete_metadata = replace(
+            metadata,
+            extra_metadata={
+                **metadata.extra_metadata,
+                "content_security": security_metadata,
+            },
+        )
+        chunks = self.chunker.chunk(document_id, sanitized_blocks)
 
         # Capture date is required in SQLite, so supply today's date when omitted.
-        complete_metadata = metadata
-        if metadata.capture_date is None:
-            complete_metadata = replace(metadata, capture_date=date.today())
+        if complete_metadata.capture_date is None:
+            complete_metadata = replace(complete_metadata, capture_date=date.today())
         validate_metadata_dates(complete_metadata)
 
         # One storage transaction writes the agency, document, and all chunks.
@@ -275,4 +382,20 @@ class DocumentIngestor:
             document_id, complete_metadata, file_hash, stored_local_path, chunks
         )
         return IngestionResult(document_id, file_hash, len(chunks), False)
+
+
+def _validate_parsed_document_limits(blocks: list[ParsedBlock]) -> None:
+    """Reject pathological parser output while allowing normal long reports.
+
+    Download byte limits remain the primary resource control. These secondary
+    bounds protect local-file ingestion and malformed PDFs that expand into an
+    unreasonable number of pages, paragraphs, or extracted characters.
+    """
+    if len(blocks) > 200_000:
+        raise DocumentSafetyError("parsed document exceeds the block limit")
+    page_numbers = [item.page_number for item in blocks if item.page_number is not None]
+    if page_numbers and max(page_numbers) > 2_500:
+        raise DocumentSafetyError("parsed document exceeds the page limit")
+    if sum(len(item.text) for item in blocks) > 25_000_000:
+        raise DocumentSafetyError("parsed document exceeds the extracted-text limit")
 

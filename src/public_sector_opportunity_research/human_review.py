@@ -1,10 +1,11 @@
 """Validate and import human feedback without changing verified RAG evidence.
 
-The static HTML reports cannot write to SQLite by themselves, and this project
-deliberately has no web server or frontend. Reviewers therefore edit a small
-JSON file and import it with the CLI. This module validates that file and asks
-``SQLiteStore`` to persist each observation in the separate ``human_reviews``
-table.
+Static HTML reports cannot write to SQLite by themselves. Reviewers may still
+edit a small JSON file and import it with the CLI; this module validates that
+legacy/report-oriented workflow and asks ``SQLiteStore`` to persist each
+observation in the separate ``human_reviews`` table. The local Streamlit
+dashboard uses the newer ``human_review_decisions`` table through
+``review_service.py`` instead.
 
 The workflow before this module is report review by a person. After import,
 feedback can be listed or exported for later evaluation work. Human comments

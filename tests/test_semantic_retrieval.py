@@ -296,3 +296,38 @@ def test_as_of_date_excludes_undated_sources_instead_of_using_capture_date(store
     response = retriever.retrieve("question", as_of_date="2026-12-31")
 
     assert response.results == []
+
+
+def test_recent_major_document_is_supplemented_when_vector_top20_omits_it(store):
+    """Metadata should rescue a current major budget without inventing scores."""
+    old_texts = [f"older vector candidate {index}" for index in range(20)]
+    current_text = "FY 2026 enterprise application modernization funding reduction"
+    vectors = {"modernization funding": [1.0, 0.0], current_text: [0.0, 1.0]}
+    vectors.update({text: [1.0, 0.001 * index] for index, text in enumerate(old_texts)})
+    _save_document(store, "old_budget", "agency-a", "budget", date(2025, 1, 1), old_texts)
+    _save_document(store, "current_budget", "agency-a", "budget", date(2026, 1, 1), [current_text])
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE documents SET title = ?, last_updated_date = ? WHERE document_id = ?",
+            ("FY 2026 Congressional Budget Justification DOL IT Modernization", "2026-05-30", "current_budget"),
+        )
+        connection.execute(
+            "UPDATE documents SET last_updated_date = ? WHERE document_id = ?",
+            ("2025-01-01", "old_budget"),
+        )
+    retriever = SemanticRetriever(
+        store, FakeEmbedder(vectors), FakeReranker({current_text: 5.0})
+    )
+
+    response = retriever.retrieve(
+        "modernization funding", agency_id="agency-a", document_type="budget",
+        top_k=20, final_k=10,
+    )
+
+    current = next(item for item in response.results if item.document_id == "current_budget")
+    assert current.retrieval_method == "metadata_supplement"
+    assert current.vector_rank is None
+    assert current.vector_similarity_score is None
+    assert current.metadata_supplement_reason
+    assert response.trace["metadata_supplement_candidates"]
+    assert response.trace["initial_candidates"]  # original vector top-20 retained

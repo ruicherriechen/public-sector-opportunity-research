@@ -71,7 +71,17 @@ def merge_trace_events(
 def merge_model_calls(
     current: list[dict[str, Any]], updates: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """Merge parallel mock-model call records by idempotent call ID."""
+    """Merge parallel structured-model call records by idempotent call ID."""
+    merged = {str(item["call_id"]): dict(item) for item in current}
+    for item in updates:
+        merged[str(item["call_id"])] = dict(item)
+    return [merged[key] for key in sorted(merged)]
+
+
+def merge_budget_events(
+    current: list[dict[str, Any]], updates: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Merge parallel budget failures by the rejected call identifier."""
     merged = {str(item["call_id"]): dict(item) for item in current}
     for item in updates:
         merged[str(item["call_id"])] = dict(item)
@@ -96,6 +106,8 @@ class ResearchGraphState(TypedDict, total=False):
     max_agent_calls: int
     max_agent_input_tokens: int
     max_agent_output_tokens: int
+    model_provider: str
+    prior_human_feedback: list[dict[str, Any]]
     tasks: list[dict[str, Any]]
     researcher_outputs: Annotated[
         list[dict[str, Any]], merge_researcher_outputs
@@ -105,4 +117,5 @@ class ResearchGraphState(TypedDict, total=False):
     route: str
     final_result: dict[str, Any]
     model_calls: Annotated[list[dict[str, Any]], merge_model_calls]
+    budget_exceeded: Annotated[list[dict[str, Any]], merge_budget_events]
     execution_trace: Annotated[list[dict[str, Any]], merge_trace_events]

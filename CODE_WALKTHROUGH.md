@@ -21,10 +21,14 @@ The application builds the local evidence layer for a future public-sector oppor
 13. calculate final award status and dates with deterministic Python/SQLite rules; and
 14. compare explicit before-award and after-award evidence databases;
 15. run a typed LangGraph with parallel strategy/procurement retrieval branches;
-16. merge those branches safely before placeholder synthesis/evaluation; and
-17. save graph checkpoints and a structured offline result without calling OpenAI.
+16. extract compact cited findings using the reproducible mock or explicitly selected OpenAI Structured Outputs;
+17. synthesize and rank supported opportunities, then run deterministic evaluation;
+18. save graph checkpoints, model-call budgets, and a structured offline result without calling OpenAI;
+19. check real-agency evidence categories for missing or stale source dates;
+20. discover bounded official `.gov` and USAspending candidates with explicit live authorization; and
+21. verify, ingest, deduplicate, and incrementally index approved HTML, PDF, and structured API evidence before running the same graph.
 
-It does **not** run autonomous research reasoning. The Research Manager, specialized researchers, Synthesis Agent, and Independent Evaluator now exist as deterministic orchestration placeholders. Their graph, retrieval calls, state merging, checkpointing, and routing are functional; their future planning, interpretation, prioritization, and independent factual evaluation are not.
+It does **not** run autonomous or general-purpose browsing. The Research Manager is a transparent deterministic planner with a source-freshness preflight. The two researchers and Synthesis Agent use either schema-validated mock responses or explicitly selected OpenAI structured reasoning. The Independent Evaluator applies deterministic citation, sufficiency, chronology, contradiction, score, and commercial-claim checks in both modes. The bounded official-source pipeline, graph, local retrieval, compact handoffs, ranking, budgets, checkpointing, and provider boundary are functional; unrestricted crawling, semantic-entailment judging, adaptive planning, and buying-persona analysis remain future work.
 
 ## 2. Architecture overview
 
@@ -143,20 +147,37 @@ public-sector-opportunity-research/
 │   ├── retrieval.py             Keyword and semantic retrieval services
 │   ├── generation.py            Provider-neutral grounded-prompt helper
 │   ├── assessment.py            OpenAI schema, citations, dates, status rules
+│   ├── openai_diagnostic.py     One-request provider compatibility check
 │   ├── demonstration.py         Explicit evidence states and saved comparison
 │   ├── evaluation.py            Offline retrieval metrics and decoy isolation
 │   ├── human_review.py          Validated reviewer-feedback import
 │   ├── reporting.py             Artifact audit and standalone HTML
 │   ├── submission.py            Offline submission-bundle orchestration
+│   ├── architecture_visualization.py Graphviz architecture and saved-run views
+│   ├── agency_registry.py        Persistent agency identity, validation, and paths
+│   ├── opportunity_explorer.py   Registry-backed search, ranking, and citations
+│   ├── review_service.py         Opportunity consolidation, lineage, and decisions
+│   ├── review_store_router.py    Agency-specific evidence/review database routing
+│   ├── review_dashboard.py       Local Streamlit opportunity-review workspace
+│   ├── windows_launcher.py       Safe Windows start/reuse/stop controller
+│   ├── feedback_followup.py      One explicit feedback-directed graph run
+│   ├── web_sources.py           .gov/Brave and USAspending source adapters
+│   ├── web_fetching.py          Redirect, robots, SSRF, retry, and byte limits
+│   ├── web_research.py          Discovery-to-existing-ingestion coordinator
 │   └── agents/
 │       ├── contracts.py         Strict Pydantic role handoff schemas
 │       ├── state.py             Typed state and parallel-write reducers
 │       ├── rag_service.py       Shared RAG adapter and LangChain tool
+│       ├── evidence.py          Citation-preserving excerpt compaction
+│       ├── mock_llm.py          Structured synthetic mock and call/token budget
+│       ├── openai_model.py       Opt-in LangChain/OpenAI structured adapter
+│       ├── codex_model.py        Opt-in isolated Codex SDK structured adapter
+│       ├── model_routing.py      Per-stage provider routing facade
 │       ├── research_manager.py  Deterministic task-plan placeholder
-│       ├── strategy_researcher.py Local strategy/budget retrieval
-│       ├── procurement_researcher.py Local procurement retrieval
-│       ├── synthesis_agent.py   Deterministic evidence consolidation
-│       ├── independent_evaluator.py Structural checks and routing
+│       ├── strategy_researcher.py Mission/need/budget extraction
+│       ├── procurement_researcher.py RFP/award/scope/vendor/date extraction
+│       ├── synthesis_agent.py   Cited opportunity merge and ranking
+│       ├── independent_evaluator.py Deterministic grounding/business checks
 │       └── graph.py             StateGraph and SQLite checkpoint runner
 └── tests/
     ├── conftest.py              Shared temporary store/chunker fixtures
@@ -167,8 +188,18 @@ public-sector-opportunity-research/
     ├── test_semantic_retrieval.py Vector, filter, rerank, and trace behavior
     ├── test_opportunity_assessment.py Grounding, status, chronology, API errors
     ├── test_langgraph_foundation.py Parallel graph, routing, tools, checkpoints
+    ├── test_architecture_visualization.py Diagram and saved-trace regressions
+    ├── test_agency_registry.py    Registration, editing, safety, and persistence
+    ├── test_opportunity_explorer.py Agency registry, search, ranking, and isolation
+    ├── test_review_dashboard.py  Review lineage, workspace, and persistence
+    ├── test_windows_launcher.py  Paths, ports, identity, reuse, and safe stop
     └── test_capstone_reporting.py Audit, HTML, feedback, secret guard
 ```
+
+The repository root also contains a `windows/` folder. Its two VBScript entry
+points start and stop the application without a console, while
+`Install Desktop Shortcuts.ps1` creates per-user `.lnk` files. Shortcut setup
+is deliberately separate from every normal launch.
 
 ## 4. Recommended first reading: the data records
 
@@ -619,13 +650,21 @@ Intent notices and executed contracts are separate types: `intent-to-award` and 
 
 Both runs share the same question, agency, BGE model, cross-encoder, OpenAI model, `top_k`, and `final_k`. The code compares the two returned statuses rather than assigning an expected value from the scenario name. Only after both API calls succeed does it save `opportunity_comparison.json` and `opportunity_comparison.md`.
 
-### Implemented orchestration with placeholder reasoning
+### Implemented offline multi-agent workflow
 
 - **Hybrid retrieval:** lexical/vector score fusion is not implemented.
 - **Graph:** Research Manager, Strategy Researcher, Procurement Researcher, Synthesis Agent, and Independent Evaluator nodes execute in a typed LangGraph. Parallel merge, routing, bounded loops, and SQLite checkpoints are functional.
-- **Agent reasoning:** all five roles are deterministic placeholders. They do not autonomously plan, interpret evidence, prioritize opportunities, map personas, browse, or perform independent factual evaluation.
+- **Structured synthetic mock:** the researcher and synthesis nodes produce compact Pydantic outputs from labeled themes in the six fictional sources. This makes the demonstration reproducible, but it is not a general LLM or an autonomous researcher.
+- **Optional OpenAI reasoning:** `openai_model.py` implements the same three-method protocol with LangChain `ChatOpenAI`, the Responses API, and Pydantic Structured Outputs. It is constructed only after an explicit CLI provider flag.
+- **Optional Codex reasoning:** `codex_model.py` implements the same protocol with the official Codex SDK, existing subscription login, an empty read-only workspace, denied approvals, and explicit tool/MCP disabling. It preserves the same prompts, schemas, citations, budgets, scoring, and evaluator.
+- **Hybrid routing:** `model_routing.py` delegates Strategy, Procurement, and Synthesis independently. A shared budget prevents stage overrides from multiplying the workflow allowance.
+- **Grounded opportunity logic:** synthesis does not aim for a target count. It creates only supported candidates, distinguishes confirmed awarded scope from a potential need, and scores mandate, repeated evidence, funding, and commercial readiness from 0 to 3. A separate deterministic readiness policy keeps those factors unchanged while labeling each candidate as a potential sales lead, confirmed procurement opportunity, awarded scope, or research lead. Potential actionability requires a specific operational need, plausible software fit, and a meaningful no-match procurement review; it never asserts that no contract exists.
+- **Independent evaluation:** deterministic code validates citation allow-lists, minimum evidence for each status, structured-date chronology, contradictions, rank/score consistency, and prohibited unsupported claims such as “definitely open.” It does not prove semantic entailment or outside-world completeness.
+- **Procurement query focus:** the complete user objective remains the Procurement Researcher's reasoning instruction, but `build_procurement_retrieval_query()` supplies BGE/MiniLM with a short contract, solicitation, vendor, scope, and controlled modernization query. This keeps policy caveats from overwhelming short award descriptions. The retrieval trace records the concise query and unchanged rankings.
+- **State procurement relevance:** MiniLM's raw score is retained for ranking and audit, but zero is not treated as universally calibrated across prose and form-like state records. A negative-scored passage is relevant only when that same passage contains explicit procurement-stage language and at least two objective-linked scope terms. This narrow deterministic corroboration recognizes structured award forms while leaving peripheral purchases unrelated.
+- **Budgets:** mock mode records lexical estimates. OpenAI mode records provider usage when available. Call/input allowance is reserved before a request, and output totals are checked after each response.
 - **LangChain tool:** the shared local RAG adapter is exposed as a typed `StructuredTool` for future bounded ReAct use, but no ReAct loop is implemented.
-- **Automated scope matching:** the LLM makes the qualitative overlap judgment; there is no trained procurement-scope classifier.
+- **Automated scope matching:** the offline mock recognizes the labeled synthetic modernization theme; there is no trained procurement-scope classifier.
 
 ## 13. Function call map
 
@@ -750,7 +789,79 @@ cli.main(import-human-review)
     └── storage.SQLiteStore.save_human_review()
 ```
 
-### Run the offline LangGraph foundation
+### Discover, ingest, and research an official agency
+
+```text
+cli.main(discover-sources)
+├── creates DiscoveryLimits from environment/CLI configuration
+├── GovernmentWebsiteAdapter.discover()
+│   ├── builds concise category queries, not an exact full-objective phrase
+│   ├── distributes candidates across evidence families
+│   └── BraveSearchProvider.search() [only when configured and authorized]
+├── USAspendingAdapter.discover() [registered + canonical federal names]
+├── SQLiteStore.save_discovery_run() [raw/accepted/rejection diagnostics]
+└── SQLiteStore.upsert_discovered_source()
+
+cli.main(ingest-discovered)
+├── SQLiteStore.list_discovered_sources()
+├── SafeWebFetcher.fetch() [website sources only]
+│   ├── validates HTTPS official domain and public DNS address
+│   ├── checks robots.txt and every redirect
+│   └── enforces retries, URL/runtime, and byte budgets
+├── DocumentIngestor.ingest_bytes()
+│   └── existing hash -> parse -> chunk -> SQLite transaction
+└── SQLiteStore.update_discovered_source()
+
+cli.main(refresh-evidence-metadata) [offline]
+├── web_research.refresh_existing_agency_metadata()
+│   ├── classifies title, URL, and bounded header text
+│   ├── extracts only labeled publication/effective/update dates
+│   └── SQLiteStore.refresh_document_metadata()
+├── preserves IDs, hashes, chunks, URLs, and provenance
+└── invalidates only stale sqlite-vec filter rows for incremental reindexing
+
+cli.main(research-agency)
+├── research_manager.plan_source_discovery()
+├── optional discover_sources() + ingest_discovered_sources()
+├── VectorIndexer.sync()
+├── SQLiteStore.evidence_inventory()
+│   └── zero usable documents/chunks/vectors stops before model construction
+└── unchanged run_offline_research_graph()
+```
+
+Discovery tables are an audit queue, not the evidence database. Search snippets
+and failures cannot be retrieved by the researchers. A candidate becomes RAG
+evidence only after the verified source content enters the ordinary `documents`
+and `chunks` tables. USAspending requests documented prime-contract codes A--D;
+IDV vehicles are excluded because a vehicle alone does not prove that a scope
+was ordered. Records are rendered as transparent field/value text while
+retaining award ID, vendor, amount/outlays, scope description, performance
+dates, NAICS/PSC, status, API identity, and canonical award URL. Optional facts
+remain `Unknown` or null. HTTP failures retain only status, category, and a
+bounded explanation.
+
+State-agency research uses the same verified `.gov` website boundary, but it
+does not treat USAspending as complete state procurement coverage. California
+project-approval forms can place a final vendor-selection result many pages
+after the title, so `classify_document_type()` checks a wider, still bounded
+text window only for exact award phrases such as `selected for final contract
+award`. The offline metadata refresh then records the matching procurement
+status while leaving unavailable state contract identifiers or vendor fields
+unknown. AES-protected government PDFs are parsed through pypdf's standard
+`cryptography` dependency; scanned/image-only PDFs still require OCR outside
+the current MVP.
+
+HTML dates are accepted only from known publisher metadata. HTTP
+`Last-Modified` and PDF modification metadata are freshness indicators, not
+publication proof. Explicitly labeled dates in source text may fill missing
+fields; fiscal-year labels, URLs, capture dates, and ambiguous dates do not.
+
+Read the new web modules after `ingestion.py` and `storage.py`, in this order:
+`web_sources.py`, `web_fetching.py`, then `web_research.py`. After that, read the
+`research-agency` branch in `cli.py` and `plan_source_discovery()` in
+`agents/research_manager.py` before returning to the normal graph flow below.
+
+### Run the multi-agent workflow
 
 ```text
 cli.main(run-agent-graph)
@@ -764,12 +875,16 @@ cli.main(run-agent-graph)
         ├── research_manager.research_manager_node()
         ├── [parallel]
         │   ├── strategy_researcher node
-        │   │   └── RAGResearchService.research(strategy, budget)
+        │   │   ├── RAGResearchService.research(strategy, budget, program-plan)
+        │   │   ├── evidence.compact_evidence()
+        │   │   └── SyntheticMockAgentModel.analyze_strategy()
         │   └── procurement_researcher node
-        │       └── RAGResearchService.research(rfp, intent, confirmed award)
+        │       ├── RAGResearchService.research(rfp, intent, confirmed award)
+        │       ├── evidence.compact_procurement_evidence()
+        │       └── SyntheticMockAgentModel.analyze_procurement()
         ├── state.merge_researcher_outputs() [safe parallel merge]
-        ├── synthesis_agent.synthesis_agent_node() [waits for both]
-        ├── independent_evaluator.independent_evaluator_node()
+        ├── synthesis_agent [waits for both; calls selected provider]
+        ├── independent_evaluator [deterministic checks only]
         └── complete / further_research / human_review
 ```
 
@@ -779,6 +894,458 @@ trace IDs flow unchanged into graph state. The service searches categories
 separately because the existing sqlite-vec query must apply document-type
 eligibility before top-k. The final JSON is a Pydantic-validated
 `ResearchGraphResult`, not free-form agent prose.
+
+### Explore validated opportunities across agencies
+
+```text
+Streamlit review_dashboard.main()
+├── agency_registry.AgencyRegistryStore.initialize()
+│   ├── creates data/agency_registry.sqlite3 when needed
+│   ├── seeds DOL, VA, HHS, EDD, and IDES with INSERT OR IGNORE
+│   ├── preserves edits and every existing stable ID/path
+│   └── returns active entries to both Explorer and review-store routing
+├── opportunity_explorer.load_explorer_agencies()
+│   ├── tries output candidates in reviewed authority order
+│   ├── validates ResearchGraphResult and evaluator safeguards
+│   ├── rejects agency/database mismatches
+│   └── resolves citations only through that agency's SQLite database
+├── opportunity_explorer.search_explorer_agencies()
+│   └── searches agency name, abbreviation, priorities, title, need, and solution
+└── review_dashboard._render_opportunity_explorer()
+    ├── searchable one-row-per-agency directory
+    ├── local + Add Agency and non-destructive Edit agency forms
+    ├── honest registered/no-research empty state
+    ├── persistent Run / Refresh / Reanalyze research controls
+    └── ranked agency opportunities with Evidence & Next Steps
+```
+
+The original tuple is now migration seed data, not a competing runtime registry.
+`AgencyRegistryStore.register_agency()` validates the name, jurisdiction/state,
+abbreviation, and canonical government domain; rejects clear conflicts; assigns
+a stable ID; derives paths beneath `data/` and `outputs/`; prepares a complete
+empty RAG schema under a temporary filename; and publishes the registry row and
+database as one bounded operation. Stored paths are revalidated when read, so
+an absolute path or `..` traversal cannot escape the repository. Registration
+does not import discovery, retrieval, LangGraph, or any provider adapter.
+
+An edit updates only mutable registry metadata. The stable ID, database path,
+output/checkpoint paths, evidence, vectors, saved JSON, and human decisions are
+not rewritten. A newly registered agency is clickable and searchable, but its
+detail view says “Research has not yet been run” until an explicitly authorized
+Run Research job publishes a validated result. No timestamp or opportunity is
+invented.
+
+### Run research without blocking Streamlit
+
+```text
+review_dashboard._render_self_service_research()
+├── ResearchJobStore.enqueue()
+│   ├── validates action, objective, provider, and aggregate budgets
+│   ├── relies on a partial UNIQUE index to prevent agency conflicts
+│   └── stores no credential value
+├── launch_research_worker()
+│   └── starts research_worker in a hidden inherited-environment process;
+│       Windows can refresh a late-added user-scope Brave key for this child
+└── research_worker.execute_job()
+    ├── atomically claims the queued row
+    ├── resolves the exact AgencyRegistryEntry and evidence SQLite path
+    ├── checks Brave presence when web discovery is requested
+    ├── checks Codex subscription readiness without submitting a turn
+    ├── builds one shell-free existing-CLI command
+    │   ├── Run/Refresh -> cli.main(research-agency --allow-live-fetch)
+    │   └── Reanalyze -> cli.main(run-agent-graph), no fetch flag
+    ├── records CLI stage markers as persistent job events
+    ├── persists schema-valid provider usage before publication validation
+    ├── stops only its owned CLI child when cancellation is requested
+    ├── validate_staged_result()
+    │   ├── Pydantic ResearchGraphResult schema
+    │   ├── shared Explorer/evaluator publication gate
+    │   ├── exact agency ID
+    │   └── every cited chunk/document resolved in that agency database
+    ├── atomically moves the immutable JSON into output history
+    └── AgencyRegistryStore.publish_output()
+        └── switches Explorer authority only after all checks pass
+```
+
+`research_jobs.py` is orchestration metadata, not graph state or evidence. Its
+SQLite database retains queued/running/terminal status, real stages, bounded
+configuration, safe errors, heartbeat, PID ownership, and unique output paths.
+The worker heartbeat lets a later dashboard reload mark an absent process as
+crashed; it does not kill an unrelated PID. Queued cancellation writes only the
+queue. Running cancellation asks the worker to terminate the exact child it
+created. Previously ingested documents may remain because each normal ingestion
+uses its existing transaction/deduplication rules, but incomplete synthesis is
+never promoted into the registry.
+
+The worker captures CLI output through a pipe, redacts credential-shaped text,
+and writes only sanitized local logs. Credential values are inherited through
+the Windows process environment and are never copied to SQLite, JSON, command
+arguments, or UI messages. Browsing the Explorer imports no provider adapter
+and performs no readiness check or network request.
+
+Publication is intentionally a separate step. A CLI exit code of zero is not
+enough: the original staged JSON must be schema-valid; the terminal evaluator
+must have completed branch, evidence, citation, chronology, contradiction,
+grounding, and unsupported-commercial-claim checks; and stable evidence IDs
+must resolve in the selected agency database. A substantively valid
+`human_review` result is published with queue status `review_needed`, not
+misrepresented as commercial confirmation. Any failure leaves the registry's
+previous candidate first and preserves existing human decisions.
+
+### Refresh multiple agencies sequentially
+
+```text
+review_dashboard._render_bulk_research_controls()
+├── Refresh All or checkbox-backed Refresh Selected
+├── one confirmation with per-agency + aggregate authorization
+└── ResearchBatchStore.create_batch()
+    ├── deduplicates stable agency IDs
+    ├── validates every approved official domain
+    ├── chooses run versus refresh from published registry state
+    ├── copies each saved objective or the approved default
+    ├── links an already-active individual job without owning it
+    └── persists ordered research_batch_items
+
+launch_batch_worker()
+├── reserves SHA-256(one-time startup proof) in SQLite
+├── starts the worker with exact argument-list paths, cwd, and PYTHONPATH
+├── waits for the final Python process to claim the proof and persist its PID
+├── fails closed on early exit, stale ownership, or startup timeout
+└── batch_worker.execute_batch()
+    ├── atomically claims the one active batch
+    ├── checks aggregate worst-case capacity
+    ├── creates one ordinary ResearchJob
+    ├── research_worker.execute_job() [existing CLI + publication gate]
+    ├── copies terminal status and actual usage to the batch
+    ├── continues after isolated failure or review_needed
+    ├── pauses on shared auth/security/infrastructure failure
+    └── repeats only after the current agency is terminal
+```
+
+The batch is an authorization and scheduling record, not a sixth agent or a
+LangGraph parent graph. `research_batches` stores aggregate limits, actual
+usage, cancellation flags, worker heartbeat, and terminal error category.
+`research_batch_items` stores ordered agency IDs, action, objective source, and
+child job ID. The child keeps the original agency database/checkpoint/output
+contracts. This composition avoids duplicating any discovery, RAG, model, or
+publication code.
+
+The two startup PIDs deserve special attention on Windows. The PID returned by
+`subprocess.Popen()` may belong to the virtual-environment redirector, while
+`batch_worker` runs under a different final Python PID. `launcher_pid` records
+the former for diagnostics; `worker_pid` is written only by the child that can
+present the one-time startup proof. The database stores only the proof's
+SHA-256 hash, while the unhashed value exists briefly in the child environment.
+It is never placed on the command line or in logs. This handshake verifies
+identity without assuming the two PIDs are equal or weakening cancellation's
+owner checks.
+
+Parent startup diagnostics and child lifecycle output use separate sanitized
+files under `.tmp/research_batches`. Separating the files also avoids two
+Windows processes writing through independent handles to the same append
+position. A failed launch has a terminal persisted status and a readable error
+category even if Streamlit is later restarted.
+
+Two SQLite uniqueness rules protect different problems. The batch table permits
+only one active scheduler, preventing a Refresh All double-click from creating
+two batches. The job table permits only one active job per agency, preventing a
+batch and individual click from researching the same agency twice. If an
+individual job wins that race, the batch records it as externally owned and
+waits; batch cancellation never terminates that independently authorized job.
+
+Cancel Remaining converts only unstarted batch items to cancelled, while the
+current owned job completes. Cancel Entire also sets the current job's existing
+cancellation flag; only its owning worker may terminate its exact CLI child.
+An absent scheduler is paused rather than restarted, because automatically
+repeating an uncertain provider turn could exceed authorization or duplicate a
+model call. Prior published outputs and human decisions are never batch state.
+
+A result file's modification time determines
+only the displayed “validated result saved” date; it never decides which result
+is authoritative. Re-evaluated VA, HHS, EDD, and IDES outputs are listed before
+their original provider outputs, while DOL uses the validated 50k pilot. A
+``human_review`` result may appear when citation, grounding, chronology,
+contradiction, and unsupported-claim checks passed; the remaining evidence gaps
+are still shown and never become proof that a procurement is open.
+
+The Explorer's presentation ranking uses only saved fields. Actionable
+readiness comes first, followed by potential research leads, insufficient-
+evidence leads, partially addressed scope, and already-awarded scope. Original
+rank breaks ties before score, because the 0–12 score also rewards mandate,
+repeated evidence, and funding. Neither source rank nor score is changed.
+Proposed-solution text is selected from an existing model inference; when no
+such inference exists, the card shows an explicit gap. The next-step question
+wraps the first saved uncertainty rather than inventing a research conclusion.
+
+Each expanded source is resolved by stable chunk ID. The loader verifies the
+SQLite row's ``agency_id`` before exposing its URL or excerpt. A missing or
+cross-agency link becomes a visible issue instead of silently using another
+database. This page is read-only and does not call retrieval, a model, or the
+network.
+
+### Launch the local application from Windows
+
+```text
+Public Sector Opportunity Explorer.lnk
+└── windows/Launch Opportunity Explorer.vbs
+    └── .venv/Scripts/pythonw.exe windows_launcher.py start
+        ├── resolve_project_root() from the script location
+        ├── validate_installation()
+        ├── launcher_lock() serializes concurrent clicks
+        ├── existing state?
+        │   └── managed_instance_is_ready()
+        │       ├── authenticated control-socket identity
+        │       └── Streamlit loopback health
+        ├── otherwise select_port_pair(8501..8510)
+        ├── hidden serve_controller()
+        │   └── owns the exact Streamlit child process
+        └── open http://127.0.0.1:<selected-port>
+
+Stop Opportunity Explorer.lnk
+└── windows/Stop Opportunity Explorer.vbs
+    └── windows_launcher.py stop
+        ├── read the saved control port and random token
+        ├── send authenticated "stop"
+        └── controller terminates only its owned Streamlit child
+```
+
+The launcher does not identify an application from an occupied port. Reuse
+requires both the random control token and the expected project/application
+identity, followed by a healthy Streamlit response. If that proof fails, the
+record is stale and is removed without killing its stored PID. Therefore an
+unrelated service on 8501 is skipped rather than reused or stopped. The state
+file lives under ignored `.tmp/`; it contains process coordination metadata,
+not credentials.
+
+Startup passes absolute dashboard, database, and output paths as a subprocess
+argument list, so spaces and OneDrive paths do not require shell escaping.
+The controller uses `pythonw.exe` and hidden Windows process flags; the actual
+dashboard still runs with the existing `.venv\Scripts\python.exe`, existing
+Streamlit entry point, and unchanged `--db`/`--outputs` arguments. The default
+browser is opened only after authenticated control and health checks succeed.
+
+### Review opportunities from terminal human-review runs
+
+```text
+Streamlit review_dashboard.main()
+├── review_store_router.AgencyReviewStoreRouter
+│   ├── maps each registered agency to its own SQLite evidence database
+│   ├── keeps --db only as a fallback for an unknown agency
+│   └── prevents a missing registered database from becoming a cross-agency lookup
+├── review_service.discover_human_review_runs(outputs/)
+│   └── Pydantic validates each saved ResearchGraphResult
+├── review_service.build_opportunity_workspaces()
+│   ├── excludes mock/synthetic runs from the active business queue
+│   ├── groups only matching agency ID + stable opportunity ID
+│   ├── keeps zero-opportunity real runs as diagnostics
+│   └── preserves older matching runs as research history
+├── review_service.workspace_review_state()
+│   ├── reuses agreement only for an identical assessment/evidence fingerprint
+│   └── reads decisions from the opportunity's agency database
+├── review_service.opportunity_lineage()
+│   ├── opportunity supporting_finding_ids
+│   ├── ResearchFinding chunk_ids
+│   ├── SQLiteStore.get_chunk_with_document()
+│   └── SQLiteStore.get_retrieval_trace()
+├── review_service.procurement_evidence_views()
+│   └── retains cited, unused, and negatively labeled records
+├── review_service.evaluation_concerns()
+│   └── separates explicitly linked issues from run-wide limitations
+└── review_service.save_decision()
+    └── saves to that agency's human_review_decisions table only
+```
+
+The routing step matters because compact output JSON stores stable document and
+chunk IDs, while the complete text remains in separate agency databases. For
+example, an IDES claimant-portal result contains IDES IDs that do not exist in
+the DOL database. The router selects `data/il_ides_research.sqlite3` before
+`opportunity_lineage()` or `procurement_evidence_views()` runs. It also keeps a
+new IDES decision beside IDES evidence. The DOL `--db` argument is retained as
+a compatibility fallback for unregistered agencies, never as a substitute for
+a missing registered database.
+
+Agree/Disagree is separate from approve/reject. `save_human_feedback()` stores
+the exact reviewed assessment, citations, procurement evidence, and dates in
+`human_feedback`; saving it never runs retrieval or a model. A later graph run
+calls `relevant_feedback_guidance()` to select at most three records by exact
+agency/opportunity identity or clear objective-word overlap. The manager and
+applicable researcher receive a compact block labeled “prior human feedback —
+not source evidence.” Since the feedback contract contains no chunk/document
+citation fields, researcher findings must still cite ordinary RAG evidence.
+
+Only an explicit follow-up action enters `feedback_followup.py`. It uses a
+disagreement explanation as the new objective, performs one bounded five-node
+graph cycle, saves a separate JSON result, and links its run ID/path back to the
+feedback row. Mock is the default. Paid OpenAI requires explicit authorization;
+live web discovery remains the separate authorized `research-agency` path.
+
+This UI runs after LangGraph; it is not a graph node and makes no model or
+retrieval call. Streamlit escapes displayed source text, source buttons accept
+only HTTP(S) URLs, and `.streamlit/config.toml` binds the prototype to localhost.
+The original JSON stays immutable. A missing finding, chunk, document, or trace
+is displayed as a broken link rather than reconstructed. The business interface
+has three sections: agency need and evidence, procurement overlap, and the
+reviewer's assessment. Raw graph objects remain in JSON/SQLite for audit but are
+not placed in the primary business workflow.
+
+### Visualize architecture and one saved execution
+
+`review_dashboard.main()` also discovers every schema-valid saved
+`ResearchGraphResult` for a read-only **Architecture & Execution** page. This
+does not broaden the Opportunity Review queue: `discover_human_review_runs()`
+still applies the original terminal-status filter for business review.
+
+`architecture_visualization.py` keeps visualization logic independent from
+Streamlit. `architecture_dot()` declares the actual manager fan-out,
+researcher join, synthesis/evaluator path, and three evaluator routes found in
+`agents/graph.py`. Supporting sources, local RAG/SQLite, and feedback memory are
+visually secondary and are not mislabeled as agents. Selecting a component
+reads its fixed educational description; it does not invoke that component.
+
+The diagram uses Graphviz's top-to-bottom layout. Strategy and Procurement are
+forced onto the same rank, while Complete and Human Review share the terminal
+rank. Larger node fonts and padding improve normal-zoom readability without
+removing any implemented edge. The bounded Evaluator-to-Manager loop remains a
+dashed, non-ranking edge so it does not distort the main hierarchy.
+
+`review_dashboard.py` owns one centralized, literal CSS block. It uses semantic
+elements and stable Streamlit test IDs rather than generated class names. The
+CSS sets the restrained light palette, typography scale, spacing, card borders,
+and narrow sidebar. Three native buttons store only the selected destination in
+browser session state; Opportunity Explorer appears first and is the default. Page
+titles are rendered after selection, so the Architecture page no longer shows
+the unrelated Opportunity Review heading. None of these view settings touch
+SQLite, graph state, or saved model results.
+
+For a saved run, the workflow is:
+
+```text
+review_service.discover_saved_graph_runs(outputs/)
+  -> strict ResearchGraphResult validation
+  -> architecture_visualization.build_execution_view()
+     -> execution_trace events grouped by iteration/node
+     -> researcher_outputs evidence and finding counts
+     -> model_calls actual call and token usage
+     -> budget_exceeded diagnostics
+     -> evaluator route extracted from its recorded trace detail
+  -> architecture_visualization.execution_dot()
+  -> Streamlit Graphviz chart + metrics/table/reasons
+```
+
+The execution builder deliberately does not reconstruct absent events. It can
+show that Strategy and Procurement were scheduled as parallel branches, but
+saved results do not record which completed first. They also lack node start/end
+timestamps and durations, and do not embed the separate checkpoint database
+path or snapshot history. The page states those limits instead of inventing a
+timeline. A model-call count is displayed as provider activity within a stage,
+not as a synonym for the full agent iteration.
+
+Only the retrieval/researcher boundary temporarily holds complete chunk text.
+Strategy calls `evidence.compact_strategy_evidence()` to select source
+sentences within an aggregate context budget. It deduplicates excerpts,
+reserves category/source diversity, and limits one long document to two chunks.
+Procurement calls
+`evidence.compact_procurement_evidence()` because aggressive sentence selection
+can separate an executed status from its vendor, dates, value, or scope. It
+keeps complete short procurement chunks when they fit, removes duplicates, and
+uses a configurable 2,000--4,000-token aggregate allowance (3,000 by default).
+For a longer result set, chunks with material procurement facts are selected
+first. Both paths carry stable document/chunk IDs, dates, ranks, and trace IDs;
+neither summarizes or invents source text. Full text remains in SQLite.
+
+Before compaction, `SemanticRetriever` checks whether current major strategy,
+budget, or performance-plan documents were absent from vector top-20. A small
+metadata supplement selects explicit recent source metadata, chooses a few
+query-related chunks, and runs them through the same MiniLM reranker. The trace
+marks supplements and preserves original semantic ranks. Fiscal years in titles
+never become publication dates.
+
+Procurement records receive `relevant`, `unrelated`, or `unknown` scope labels.
+An executed record alone cannot support `already_awarded`; it must also have
+positive objective-scope relevance. Missing RFP or intent stages remain
+coverage gaps when a relevant executed award is otherwise supported.
+
+Because evidence is fixed during one graph invocation, a follow-up iteration
+reuses prior researcher and synthesis outputs when IDs are unchanged. A
+rejected budget reservation becomes a typed diagnostic and `human_review`
+result instead of an uncaught traceback. The default run still makes exactly
+three budgeted structured calls—strategy, procurement, and synthesis—and no
+evaluator model call.
+
+All providers share defaults of six calls, 50,000 cumulative input tokens,
+and 6,000 cumulative output tokens. Strategy and Procurement still receive no
+more than 3,000 evidence-context tokens apiece by default; prompts, metadata,
+schemas, and synthesis input account for the remainder. When provider-reported
+usage exceeds a limit only after a schema-valid OpenAI response returns, its
+actual input/output usage is retained in `model_calls` before further model
+work stops and the graph routes to human review.
+
+`--model-provider mock` is the default. With the explicit `openai` selection,
+`graph.run_offline_research_graph()` lazily constructs
+`OpenAIStructuredAgentModel`. Each invocation creates a new system/user message
+pair containing only the objective and compact role input. The adapter asks
+LangChain for JSON-schema output, validates it with Pydantic, captures provider
+token usage, and returns the same `ModelInvocation` used by mock mode. Research
+nodes then apply citation allow-lists, synthesis reapplies scoring in Python,
+and the deterministic evaluator remains unchanged.
+
+`_openai_output_schema()` is an important compatibility boundary. Pydantic's
+application contracts include string-length limits, but the current OpenAI
+strict Structured Outputs subset does not accept `minLength` or `maxLength` in
+the request schema. The helper recursively removes only those two provider-side
+keywords. `_parse_structured_response()` then validates the returned object
+against the original Pydantic class, so the length rules still apply inside
+the application. `_sanitized_provider_error()` reads only safe SDK error fields
+(status, code, parameter, and message), redacts credential/request-content
+patterns, and never serializes the failed request or prompt.
+
+LangChain raises `OpenAIInvalidRequestError` from the original OpenAI SDK
+exception. The diagnostic helper follows that bounded cause/context chain and,
+when necessary, decodes `response.json()` only long enough to copy the nested
+`error.code`, `error.type`, `error.param`, and `error.message`. It never emits
+the complete response, request, headers, or source excerpts. Manual schemas put
+`strict: true` directly in `text.format`, because LangChain does not propagate
+the separate method argument into that manual dictionary. The standalone
+`openai_diagnostic.py` command exercises the same LangChain Responses path with
+fixed harmless text and a tiny schema, without opening SQLite or loading RAG.
+
+With explicit `codex` selection, `graph.run_offline_research_graph()` lazily
+constructs `CodexStructuredAgentModel`. The adapter sends the same system
+prompt as thread base instructions and the same compact JSON payload as the
+turn input. The official SDK receives the original Pydantic JSON Schema, and
+the returned JSON is validated locally with that Pydantic model before graph
+nodes see it. Provider usage is recorded when available; otherwise lexical
+counts are labeled `estimated`. A completed but malformed response retains its
+call record on the safe exception because subscription capacity was consumed.
+
+Each Codex call creates a new empty temporary working directory and ephemeral
+thread. Read-only sandboxing, denied approvals, `mcp_servers={}`, disabled web
+search, and disabled known shell/app/plugin/browser/computer/multi-agent
+features keep the provider at a model-only boundary. The repository is not the
+thread working directory. Authentication and CA settings are inherited from
+the existing environment; code never reads or copies authentication files.
+`codex_readiness()` starts transport and an empty thread but sends no model
+turn, which is why readiness is not evidence of inference or output quality.
+`codex_diagnostic.py` is deliberately separate: it requires the CLI
+`--allow-inference` acknowledgement and submits exactly one small fixed
+fictional Strategy response to verify schema-constrained inference.
+
+The bounded live validation on 2026-11-17 used ChatGPT subscription login and
+`gpt-6.1-sol`. The minimal fixture and repeat both produced one grounded
+finding with nearly identical provider usage. The full synthetic graph emitted
+five Strategy findings, eleven Procurement findings, two opportunities, valid
+citations, correct chronology, and no unsupported commercial claim. One
+Procurement statement contained a truncated partial word, and the Synthesis
+summary named the wrong score scale even though `_apply_scoring_rules()` saved
+the correct 0--3 factors. This is why provider validation includes semantic
+review in addition to JSON/Pydantic acceptance.
+
+`StageRoutedAgentModel` keeps routing outside graph nodes. Its Strategy method
+delegates to the Strategy adapter, Procurement to Procurement, and Synthesis to
+Synthesis. The runner constructs only the distinct selected adapters and gives
+all of them the same `AgentBudgetTracker`. Saved per-call records therefore
+show the real provider/model even when `ResearchGraphResult.model_provider` is
+`mixed`. Manager and evaluator never call this facade.
 
 ## 14. How the six synthetic documents demonstrate RAG needs
 
@@ -861,9 +1428,10 @@ Reducers keyed by iteration/role preserve both concurrent researcher writes.
 
 **Alternatives:** plain Python function calls would be sufficient for a single
 linear pass but would require custom loop, checkpoint, and parallel-merge code.
-A general task queue would add deployment complexity before agent behavior is
-ready. The current graph uses deterministic functions rather than prebuilt
-autonomous agents so its behavior remains inspectable.
+A general task queue would add deployment complexity before live agent behavior
+is ready. The current graph uses a deterministic manager/evaluator and a
+provider-neutral structured boundary rather than prebuilt autonomous agents,
+so mock behavior remains inspectable and live reasoning stays bounded.
 
 ### Why separate evidence, graph state, and checkpoints?
 
@@ -885,7 +1453,7 @@ production system could use a remote checkpoint store. The local separate
 - Lexical token counts differ from future model-specific token counts.
 - Chunk metadata stores the first heading/page represented, not a full range.
 - Exact hash deduplication does not find semantic near-duplicates.
-- Direct URL ingestion buffers the whole PDF, has no retry/authentication/archive behavior, and is not a crawler.
+- The legacy direct-PDF command buffers one file and has no retry/archive behavior. Milestone 3's separate safe fetcher adds bounded retries, robots/redirect/network checks, and HTML support, but still does not authenticate, archive raw responses, or crawl links.
 - Semantic models require a first-use download and add CPU/memory cost.
 - sqlite-vec is pre-1.0 and requires filter keys duplicated in its virtual table.
 - Dense retrieval and the generic reranker have not been evaluated on labeled public-sector relevance judgments.
@@ -895,8 +1463,9 @@ production system could use a remote checkpoint store. The local separate
 - Contract-specific fields currently live in extensible `metadata_json`; a larger system would normalize procurement entities and amendments.
 - The demonstration selects documents by type and assumes those types describe one coherent synthetic modernization scenario.
 - OpenAI execution depends on external credentials, model access, network availability, and provider uptime.
-- The five LangGraph roles use deterministic placeholder logic. They do not autonomously reason, browse, prioritize opportunities, identify buying personas, or establish factual/commercial completeness.
-- The placeholder evaluator checks structural coverage and citations only. It does not yet evaluate entailment, contradictions, scope quality, or commercial whitespace.
+- The mock researcher/synthesis logic recognizes only labeled themes in the six synthetic documents. It does not generalize to real agencies, map buying personas, or establish outside-world completeness.
+- OpenAI graph mode provides general language reasoning over already ingested evidence; source acquisition remains a separate deterministic preflight. Neither component guarantees external completeness or factual correctness. Automated tests use injected fakes and make no live calls.
+- The evaluator checks declared citation, sufficiency, chronology, contradiction, scoring, and commercial-claim rules. It does not yet judge semantic entailment, nuanced scope quality, or every form of commercial whitespace.
 - `SqliteSaver` is appropriate for the local synchronous demonstration, not a production multi-user workload. Its checkpoint file is workflow state, not evidence.
 
 These are documented constraints of the current scope, not hidden future capabilities.
@@ -904,7 +1473,7 @@ These are documented constraints of the current scope, not hidden future capabil
 ## 17. Glossary
 
 **Agent**  
-A software component that uses a model and tools to pursue a goal through multiple decisions. This project currently has agent-shaped graph nodes with deterministic placeholder behavior, not autonomous model-driven researchers.
+A software component that uses a model and tools to pursue a goal through multiple decisions. This project has bounded graph nodes with real retrieval and optional structured model reasoning, not autonomous general-purpose researchers.
 
 **Checkpoint**
 A saved snapshot of graph state. LangGraph groups local SQLite checkpoints by
@@ -958,7 +1527,20 @@ A model that can generate text from instructions and context. This project calls
 **LangChain tool**
 A typed callable that a future model-driven agent can invoke. The current
 `search_local_evidence` tool wraps the same local RAG service used directly by
-the deterministic researcher placeholders.
+the offline researcher nodes.
+
+**Mock LLM**
+
+A deterministic test double that implements the same typed boundary planned for
+a future model but makes no network call. This project's mock is intentionally
+specific to its clearly labeled fictional corpus.
+
+**Call/token budget**
+
+Limits on structured-model invocations and approximate lexical input/output
+tokens. Defaults are six calls, 50,000 cumulative input tokens, and 6,000
+cumulative output tokens. The budget makes future live execution costs bounded
+and visible, even though the current mock uses no paid service.
 
 **LangGraph `StateGraph`**
 A graph whose nodes read shared typed state and return partial updates. It
@@ -1018,10 +1600,14 @@ Nearest-neighbor search over embedding vectors. The vec0 table performs cosine K
 1. Read `models.py` to learn the data moving between stages.
 2. Read `dates.py` and `ids.py` for small, pure functions.
 3. Read `config.py` to see environment-backed construction.
+   Next, read `document_security.py` to see actual-type validation, blocked
+   signatures, prompt-injection indicators, secret redaction, and truthful
+   optional local malware-scanner reporting before parsing.
 4. Read `parsing.py` with one synthetic TXT document open beside it.
 5. Read `chunking.py`, referring back to `ParsedBlock` and `Chunk`.
 6. Read `storage.py` and sketch the three-table relationship.
-7. Read `ingestion.py` to see the previous modules composed into one pipeline and date validation.
+7. Read `ingestion.py` to see security validation, bounded parsing, redaction,
+   chunking, date validation, deduplication, and storage composed.
 8. Read `synthetic_demo.py` to see explicit reviewed metadata and post-write verification.
 9. Read `embeddings.py` to understand the shared local-model interfaces and query instruction.
 10. Read `indexing.py` to see stable chunk IDs become an incremental vector work queue.
@@ -1035,11 +1621,21 @@ Nearest-neighbor search over embedding vectors. The vec0 table performs cosine K
 18. Read `reporting.py`, then `submission.py`, to follow existing JSON/SQLite artifacts into standalone HTML and submission files.
 19. Begin the graph layer with `agents/contracts.py`, then `agents/state.py`, to understand typed handoffs and parallel reducers.
 20. Read `agents/rag_service.py` to see the existing retriever adapted into a shared service and future LangChain tool.
-21. Read `agents/research_manager.py`, the two researcher modules, `agents/synthesis_agent.py`, and `agents/independent_evaluator.py` in workflow order. Mark each placeholder limitation as you read.
-22. Read `agents/graph.py` to see fan-out, the two-branch join, conditional edges, bounded loops, and separate SQLite checkpointing.
-23. Read `LANGGRAPH_ARCHITECTURE.md` for the visual graph and replacement sequence.
-24. Read `cli.py`, then `__main__.py`, to trace real commands into ingestion, retrieval, assessment, evaluation, reporting, and graph execution.
-25. Read `test_langgraph_foundation.py`, `test_opportunity_assessment.py`, and `test_capstone_reporting.py`, then the remaining tests, to see executable orchestration, grounding, and failure examples.
+21. Read `agents/evidence.py`, then `agents/mock_llm.py`, to see compact excerpts, typed mock outputs, citation reuse, opportunity scoring, and call/token accounting.
+22. Read `agents/openai_model.py` to see isolated prompts, Structured Outputs, error handling, provider token usage, and deterministic rescoring.
+23. Read `agents/codex_model.py`, then `agents/model_routing.py`, to compare the isolated Codex transport and stage-specific delegation without changing the protocol.
+24. Read `openai_diagnostic.py` to see how one bounded live compatibility check is isolated from RAG and graph execution.
+24. Read `agents/research_manager.py`, the two researcher modules, `agents/synthesis_agent.py`, and `agents/independent_evaluator.py` in workflow order. Separate provider interpretation from deterministic validation as you read.
+25. Read `agents/graph.py` to see provider selection, fan-out, the two-branch join, conditional edges, bounded loops, budget packaging, and separate SQLite checkpointing.
+26. Read `LANGGRAPH_ARCHITECTURE.md` for the visual graph and extension sequence.
+27. Read `cli.py`, then `__main__.py`, to trace real commands into ingestion, retrieval, assessment, evaluation, reporting, and graph execution.
+28. Read `agency_registry.py` to see legacy migration seeds, validation, stable IDs, path safety, atomic registration, and non-destructive edits.
+29. Read `opportunity_explorer.py` to see how registered agencies stay paired with their databases, represent an honest no-research state, become searchable, and receive a presentation-only business ranking.
+30. Read `review_service.py`, then `review_store_router.py`, `architecture_visualization.py`, and `review_dashboard.py`, to follow saved-run discovery, registry-backed SQLite routing, agency forms, truthful diagram construction, Explorer rendering, evidence lineage, procurement review, and separate human decisions.
+31. Read `research_jobs.py` and then `research_worker.py` to see persistent queue state, process ownership, CLI reuse, credential boundaries, cancellation, citation validation, and atomic result publication.
+32. Read `research_batches.py` and then `batch_worker.py` to see one-confirmation aggregate limits, objective selection, sequential child-job scheduling, continuation rules, cancellation, and conservative crash recovery.
+33. Read `windows_launcher.py` and the small `windows/` scripts to see how one-click startup validates paths, distinguishes its own server from an unrelated port, inherits user environment configuration, and stops only its owned child.
+34. Read `test_agency_registry.py`, `test_opportunity_explorer.py`, `test_research_jobs.py`, `test_research_batches.py`, `test_architecture_visualization.py`, `test_review_dashboard.py`, `test_windows_launcher.py`, `test_openai_agent_model.py`, `test_openai_request_compatibility.py`, `test_langgraph_foundation.py`, `test_opportunity_assessment.py`, and `test_capstone_reporting.py`, then the remaining tests, to see registration safety, agency isolation, individual and batch publication safeguards, saved-trace visualization, dashboard persistence, launcher safety, provider fakes, request-shape audits, orchestration, grounding, budgets, and failure examples.
 
 At that point, run an ingestion command, list its chunks, and trace the call map in section 13. That exercise connects the static code to the actual runtime flow.
 

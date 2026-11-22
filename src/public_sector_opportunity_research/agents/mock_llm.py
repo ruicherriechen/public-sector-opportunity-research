@@ -41,6 +41,21 @@ T = TypeVar("T", bound=BaseModel)
 class AgentBudgetExceeded(RuntimeError):
     """Report that the configured call or approximate token budget was exceeded."""
 
+    def __init__(self, message: str, *, budget_kind: str, call_id: str,
+                 attempted_tokens: int, used_tokens: int, projected_tokens: int,
+                 limit: int, call_record: ModelCallRecord | None = None) -> None:
+        super().__init__(message)
+        self.budget_kind = budget_kind
+        self.call_id = call_id
+        self.attempted_tokens = attempted_tokens
+        self.used_tokens = used_tokens
+        self.projected_tokens = projected_tokens
+        self.limit = limit
+        # A provider can return more tokens than the conservative preflight
+        # estimate.  In that case the paid call already happened, so retain its
+        # actual usage even though downstream model work must stop gracefully.
+        self.call_record = call_record
+
 
 @dataclass(frozen=True)
 class ModelInvocation(Generic[T]):
@@ -52,6 +67,10 @@ class ModelInvocation(Generic[T]):
 
 class StructuredAgentModel(Protocol):
     """Declare the three structured model operations used by graph nodes."""
+
+    @property
+    def provider_name(self) -> str:
+        """Return the provider label stored in graph handoffs."""
 
     @property
     def model_name(self) -> str:
@@ -100,7 +119,7 @@ class AgentBudgetTracker:
         self,
         *,
         max_calls: int = 6,
-        max_input_tokens: int = 12000,
+        max_input_tokens: int = 50000,
         max_output_tokens: int = 6000,
     ) -> None:
         """Create a tracker with positive workflow-wide limits."""
@@ -110,7 +129,122 @@ class AgentBudgetTracker:
         self.max_input_tokens = max_input_tokens
         self.max_output_tokens = max_output_tokens
         self._records: dict[str, ModelCallRecord] = {}
+        self._reservations: dict[str, int] = {}
         self._lock = Lock()
+
+    def reserve(
+        self,
+        *,
+        call_id: str,
+        input_payload: object,
+    ) -> int:
+        """Reserve one call and its estimated input before provider execution.
+
+        A live provider must not be contacted when the workflow has already
+        exhausted its call or input allowance. The reservation is protected by
+        the same lock used by both parallel researcher branches.
+
+        Returns:
+            The estimated input-token count reserved for this call.
+        """
+        input_tokens = _estimate_tokens(_json_text(input_payload))
+        with self._lock:
+            if call_id in self._records:
+                return self._records[call_id].input_tokens
+            if call_id in self._reservations:
+                return self._reservations[call_id]
+            calls = len(self._records) + len(self._reservations) + 1
+            inputs = (
+                sum(item.input_tokens for item in self._records.values())
+                + sum(self._reservations.values())
+                + input_tokens
+            )
+            if calls > self.max_calls:
+                raise AgentBudgetExceeded(
+                    f"Agent call budget exceeded ({calls}>{self.max_calls})",
+                    budget_kind="calls", call_id=call_id, attempted_tokens=1,
+                    used_tokens=calls - 1, projected_tokens=calls,
+                    limit=self.max_calls,
+                )
+            if inputs > self.max_input_tokens:
+                raise AgentBudgetExceeded(
+                    "Agent input-token budget exceeded "
+                    f"({inputs}>{self.max_input_tokens})",
+                    budget_kind="input_tokens", call_id=call_id,
+                    attempted_tokens=input_tokens, used_tokens=inputs - input_tokens,
+                    projected_tokens=inputs, limit=self.max_input_tokens,
+                )
+            self._reservations[call_id] = input_tokens
+            return input_tokens
+
+    def release(self, call_id: str) -> None:
+        """Release an unfinished reservation after a provider failure."""
+        with self._lock:
+            self._reservations.pop(call_id, None)
+
+    def complete(
+        self,
+        *,
+        call_id: str,
+        stage: str,
+        provider: str,
+        model_name: str,
+        input_tokens: int,
+        output_tokens: int,
+        usage_source: str,
+        status: str = "succeeded",
+        retry_count: int = 0,
+        error_category: str | None = None,
+    ) -> ModelCallRecord:
+        """Complete a reserved call using provider or estimated token usage.
+
+        A live provider can report more tokens than the pre-call estimate. The
+        completed call is recorded before a post-response limit exception is
+        raised, ensuring paid usage remains visible in the final graph result.
+        """
+        with self._lock:
+            if call_id in self._records:
+                self._reservations.pop(call_id, None)
+                return self._records[call_id]
+            self._reservations.pop(call_id, None)
+            inputs = sum(item.input_tokens for item in self._records.values()) + input_tokens
+            outputs = sum(item.output_tokens for item in self._records.values()) + output_tokens
+            record = ModelCallRecord(
+                call_id=call_id,
+                stage=stage,
+                provider=provider,
+                model_name=model_name,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                usage_source=usage_source,
+                status=status,
+                retry_count=retry_count,
+                error_category=error_category,
+            )
+            if inputs > self.max_input_tokens:
+                self._records[call_id] = record
+                raise AgentBudgetExceeded(
+                    "Agent input-token budget exceeded after provider usage "
+                    f"({inputs}>{self.max_input_tokens})",
+                    budget_kind="input_tokens", call_id=call_id,
+                    attempted_tokens=input_tokens,
+                    used_tokens=inputs - input_tokens,
+                    projected_tokens=inputs, limit=self.max_input_tokens,
+                    call_record=record,
+                )
+            if outputs > self.max_output_tokens:
+                self._records[call_id] = record
+                raise AgentBudgetExceeded(
+                    "Agent output-token budget exceeded "
+                    f"({outputs}>{self.max_output_tokens})",
+                    budget_kind="output_tokens", call_id=call_id,
+                    attempted_tokens=output_tokens,
+                    used_tokens=outputs - output_tokens,
+                    projected_tokens=outputs, limit=self.max_output_tokens,
+                    call_record=record,
+                )
+            self._records[call_id] = record
+            return record
 
     def record(
         self,
@@ -122,45 +256,24 @@ class AgentBudgetTracker:
         output_payload: BaseModel,
     ) -> ModelCallRecord:
         """Validate cumulative limits and return an idempotent call record."""
-        input_tokens = _estimate_tokens(_json_text(input_payload))
+        input_tokens = self.reserve(call_id=call_id, input_payload=input_payload)
         output_tokens = _estimate_tokens(output_payload.model_dump_json())
-        with self._lock:
-            if call_id in self._records:
-                return self._records[call_id]
-            calls = len(self._records) + 1
-            inputs = sum(item.input_tokens for item in self._records.values()) + input_tokens
-            outputs = (
-                sum(item.output_tokens for item in self._records.values()) + output_tokens
-            )
-            if calls > self.max_calls:
-                raise AgentBudgetExceeded(
-                    f"Agent call budget exceeded ({calls}>{self.max_calls})"
-                )
-            if inputs > self.max_input_tokens:
-                raise AgentBudgetExceeded(
-                    "Agent input-token budget exceeded "
-                    f"({inputs}>{self.max_input_tokens})"
-                )
-            if outputs > self.max_output_tokens:
-                raise AgentBudgetExceeded(
-                    "Agent output-token budget exceeded "
-                    f"({outputs}>{self.max_output_tokens})"
-                )
-            record = ModelCallRecord(
-                call_id=call_id,
-                stage=stage,
-                model_name=model_name,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-            )
-            self._records[call_id] = record
-            return record
+        return self.complete(
+            call_id=call_id,
+            stage=stage,
+            provider="mock",
+            model_name=model_name,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            usage_source="estimated",
+        )
 
 
 class SyntheticMockAgentModel:
     """Return deterministic structured responses for the synthetic corpus only."""
 
     model_name = "synthetic-structured-mock-v1"
+    provider_name = "mock"
 
     def __init__(self, budget: AgentBudgetTracker | None = None) -> None:
         """Attach a shared budget tracker without loading any external model."""
@@ -174,6 +287,22 @@ class SyntheticMockAgentModel:
         iteration: int,
     ) -> ModelInvocation[ResearchAnalysis]:
         """Extract documented strategy, operational, and funding facts."""
+        if not _is_labeled_synthetic_evidence(evidence):
+            output = ResearchAnalysis(
+                summary=(
+                    "Mock mode does not interpret unfamiliar real-agency sources; "
+                    "no findings were asserted and human or explicit live-model "
+                    "review is required."
+                ),
+                findings=[],
+            )
+            return self._invocation(
+                stage="strategy_researcher",
+                iteration=iteration,
+                input_payload={"objective": objective, "evidence": evidence},
+                output=output,
+            )
+
         findings: list[ResearchFinding] = []
         for item in evidence:
             text = item.excerpt.casefold()
@@ -264,6 +393,21 @@ class SyntheticMockAgentModel:
         iteration: int,
     ) -> ModelInvocation[ResearchAnalysis]:
         """Extract procurement facts while preserving award-status distinctions."""
+        if not _is_labeled_synthetic_evidence(evidence):
+            output = ResearchAnalysis(
+                summary=(
+                    "Mock mode does not interpret unfamiliar real-agency procurement "
+                    "records; missing findings do not establish that no award exists."
+                ),
+                findings=[],
+            )
+            return self._invocation(
+                stage="procurement_researcher",
+                iteration=iteration,
+                input_payload={"objective": objective, "evidence": evidence},
+                output=output,
+            )
+
         findings: list[ResearchFinding] = []
         for item in evidence:
             text = item.excerpt.casefold()
@@ -288,13 +432,23 @@ class SyntheticMockAgentModel:
                         ),
                     ]
                 )
+                if "2027-09-18" in text and "2027-11-03" in text:
+                    findings.append(
+                        _finding(
+                            "rfp-resident-date",
+                            "procurement_date",
+                            "The fictional RFP was published on 2027-09-18 and listed a proposal due date of 2027-11-03.",
+                            item,
+                            "high",
+                        )
+                    )
             elif item.document_type == "intent-to-award":
                 findings.extend(
                     [
                         _finding(
                             "intent-award-status",
                             "award_status",
-                            "A notice stated an intent to award NDRS-2028-017; it was not proof of an executed contract.",
+                            "A notice stated an intent to award the Resident Access and Integration Platform procurement NDRS-2028-017; it was not proof of an executed contract.",
                             item,
                             "high",
                         ),
@@ -307,6 +461,16 @@ class SyntheticMockAgentModel:
                         ),
                     ]
                 )
+                if "2028-01-22" in text and "2028-02-15" in text:
+                    findings.append(
+                        _finding(
+                            "intent-award-date",
+                            "procurement_date",
+                            "The fictional intent notice was published on 2028-01-22 and listed an anticipated notice-to-proceed date of 2028-02-15.",
+                            item,
+                            "high",
+                        )
+                    )
             elif item.document_type == "confirmed-award" and (
                 "executed" in text or "contract status" in text
             ):
@@ -322,7 +486,11 @@ class SyntheticMockAgentModel:
                         _finding(
                             "confirmed-award-scope",
                             "contract_scope",
-                            "The executed scope covers the resident portal, identity, guided intake, document exchange, multilingual communications, status tracking, APIs, assurance, training, and phased rollout.",
+                            (
+                                "The $11,850,000 executed scope (up to $17,200,000 with fictional options) covers the resident portal, identity, guided intake, document exchange, multilingual communications, status tracking, APIs, assurance, training, and phased rollout."
+                                if "$11,850,000" in text and "$17,200,000" in text
+                                else "The executed scope covers the resident portal, identity, guided intake, document exchange, multilingual communications, status tracking, APIs, assurance, training, and phased rollout."
+                            ),
                             item,
                             "high",
                         ),
@@ -442,6 +610,25 @@ def _finding(
     )
 
 
+def _is_labeled_synthetic_evidence(
+    evidence: Sequence[EvidenceReference],
+) -> bool:
+    """Allow scripted mock claims only for explicitly fictional source text.
+
+    The original six-document demonstration repeatedly labels its documents as
+    SYNTHETIC/FICTIONAL. Real government excerpts therefore take the safe
+    abstention path instead of accidentally matching generic words like
+    ``single`` or ``api`` and receiving synthetic resident-service claims.
+    """
+    return bool(evidence) and all(
+        any(
+            marker in f"{item.document_title} {item.excerpt}".casefold()
+            for marker in ("synthetic", "fictional")
+        )
+        for item in evidence
+    )
+
+
 def _deduplicate_findings(findings: Sequence[ResearchFinding]) -> list[ResearchFinding]:
     """Return one finding per stable ID in deterministic order."""
     by_id = {item.finding_id: item for item in findings}
@@ -515,6 +702,7 @@ def _modernization_opportunity(
         status=status,
         rank=1,
         score=score,
+        commercially_actionable=not confirmed and score.commercial_readiness > 0,
         supporting_finding_ids=sorted(item.finding_id for item in findings),
         supporting_chunk_ids=_unique(
             value for item in findings for value in item.chunk_ids
@@ -533,7 +721,7 @@ def _modernization_opportunity(
         commercial_implications=(
             "The core platform scope is not treated as a new available opportunity because an executed synthetic contract covers substantially the same work."
             if confirmed
-            else "The documented need warrants procurement-status research; missing award evidence would not prove that no contract exists."
+            else "The documented need warrants procurement-status research; missing award evidence does not establish contract absence."
         ),
         uncertainties=(
             [
@@ -541,7 +729,7 @@ def _modernization_opportunity(
             ]
             if confirmed
             else [
-                "The corpus does not prove an open solicitation or the absence of another contract."
+                "The corpus does not establish an open solicitation or contract absence."
             ]
         ),
     )
@@ -567,6 +755,7 @@ def _integrity_opportunity(findings: Sequence[ResearchFinding]) -> OpportunityCa
         status="potential",
         rank=1,
         score=score,
+        commercially_actionable=False,
         supporting_finding_ids=sorted(item.finding_id for item in findings),
         supporting_chunk_ids=_unique(
             value for item in findings for value in item.chunk_ids
@@ -580,7 +769,7 @@ def _integrity_opportunity(findings: Sequence[ResearchFinding]) -> OpportunityCa
             "Treat this as a research lead, not a known open procurement: the current corpus contains no linked budget, RFP, or confirmed award for this scope."
         ),
         uncertainties=[
-            "Absent linked procurement evidence is not proof that no contract exists.",
+            "Absent linked procurement evidence does not establish contract absence.",
             "No dedicated funding or acquisition timeline is documented in the available evidence.",
         ],
     )
@@ -604,7 +793,11 @@ def _json_text(value: object) -> str:
     """Serialize Pydantic-rich payloads consistently for token estimation."""
     def default(item: object):
         if isinstance(item, BaseModel):
-            return item.model_dump(mode="json")
+            # Prompt accounting mirrors the compact provider payload: absent
+            # optional fields and unchanged defaults add no model value.
+            return item.model_dump(
+                mode="json", exclude_none=True, exclude_defaults=True
+            )
         return str(item)
 
     return json.dumps(value, default=default, sort_keys=True)

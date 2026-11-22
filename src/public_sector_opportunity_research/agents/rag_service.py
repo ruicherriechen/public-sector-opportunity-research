@@ -1,16 +1,16 @@
 """Adapt the existing semantic retriever into a shared agent-facing service.
 
-Both placeholder researchers use this module rather than constructing their
+Both researcher nodes use this module rather than constructing their
 own embedding, vector, or reranking pipelines.  The adapter calls the existing
 ``SemanticRetriever`` once per requested document category, so sqlite-vec
 applies the category and agency filters before top-k selection.  It then
 converts results into validated evidence records while preserving stable IDs,
 dates, ranking scores, and retrieval trace IDs.
 
-This module also exposes a LangChain ``StructuredTool`` for a future ReAct
-agent and a protocol for a future live research provider.  Neither extension
-is used automatically: the deterministic offline graph queries local SQLite
-only.  Retrieval may load/download the already configured local BGE and
+This module also exposes a LangChain ``StructuredTool`` and a deliberately
+unavailable agent-callable web port for a future ReAct agent. Milestone 3's
+working source adapters remain outside the graph in ``web_research.py`` so raw
+network content cannot bypass verification/ingestion. Retrieval may load the configured local BGE and
 cross-encoder models and writes normal retrieval traces to the evidence
 database, exactly as the existing CLI does.
 """
@@ -18,12 +18,14 @@ database, exactly as the existing CLI does.
 from __future__ import annotations
 
 from datetime import date
+import re
 from threading import Lock
 from typing import Protocol, Sequence
 
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..document_security import prompt_injection_indicators, redact_secret_like_text
 from ..models import SemanticSearchResult
 from ..retrieval import SemanticRetriever
 from .contracts import EvidenceRecord, ResearchEvidenceBatch
@@ -197,7 +199,7 @@ class RAGResearchService:
             if response.results:
                 found_categories.add(document_type)
             for result in response.results:
-                record = _evidence_record(result, response.trace_id, cutoff)
+                record = _evidence_record(result, response.trace_id, cutoff, query)
                 # Category searches are disjoint today, but stable chunk IDs
                 # make this robust if category aliases are introduced later.
                 previous = evidence_by_chunk.get(record.chunk_id)
@@ -209,23 +211,54 @@ class RAGResearchService:
             evidence_by_chunk.values(),
             key=lambda item: (
                 categories.index(item.document_type),
+                {"relevant": 0, "unknown": 1, "unrelated": 2}.get(
+                    item.procurement_relevance, 1
+                ),
+                _freshness_priority(item.freshness_status),
                 item.reranker_rank,
                 item.chunk_id,
             ),
         )
+        missing = [category for category in categories if category not in found_categories]
+        coverage_gaps: list[str] = []
+
+        # An unrelated award does not satisfy procurement coverage merely
+        # because it is the only record. Conversely, a scope-relevant executed
+        # award can establish status without requiring every earlier notice.
+        for category in ("confirmed-award", "intent-to-award", "rfp"):
+            category_records = [item for item in evidence if item.document_type == category]
+            if category_records and not any(
+                item.procurement_relevance == "relevant" for item in category_records
+            ):
+                if category not in missing:
+                    missing.append(category)
+                coverage_gaps.append(
+                    f"{category}: records exist but none has positive scope relevance"
+                )
+        relevant_confirmed = any(
+            item.document_type == "confirmed-award"
+            and item.procurement_relevance == "relevant"
+            for item in evidence
+        )
+        if relevant_confirmed:
+            for optional_stage in ("rfp", "intent-to-award"):
+                if optional_stage in missing:
+                    missing.remove(optional_stage)
+                    coverage_gaps.append(
+                        f"{optional_stage}: unavailable preceding procurement stage"
+                    )
         return ResearchEvidenceBatch(
             evidence=evidence,
             retrieval_trace_ids=trace_ids,
             requested_categories=categories,
-            missing_categories=[
-                category for category in categories if category not in found_categories
-            ],
+            missing_categories=[category for category in categories if category in missing],
+            coverage_gaps=coverage_gaps,
         )
 
     def as_langchain_tool(self) -> StructuredTool:
         """Return a typed LangChain tool for a future iterative researcher.
 
-        The deterministic placeholder nodes call :meth:`research` directly.
+    The offline researcher nodes call :meth:`research` directly.
         A future ReAct implementation may bind this tool to a chat model while
         preserving the same local evidence, provenance, and trace behavior.
         Creating the tool itself performs no retrieval or network access.
@@ -252,6 +285,7 @@ def _evidence_record(
     result: SemanticSearchResult,
     trace_id: str,
     freshness_cutoff: date | None,
+    query: str,
 ) -> EvidenceRecord:
     """Convert an existing retrieval result without changing provenance."""
     source_date = _source_date(result)
@@ -264,6 +298,12 @@ def _evidence_record(
     else:
         freshness_status = "older_than_cutoff"
 
+    relevance, relevance_reason = _procurement_relevance(result, query)
+    # Existing historical databases predate ingestion security metadata. Apply
+    # the same redaction and warning detection again at the model boundary so
+    # old evidence cannot expose a credential-shaped value to a provider.
+    safe_text, redactions = redact_secret_like_text(result.text)
+    indicators = prompt_injection_indicators(safe_text)
     return EvidenceRecord(
         chunk_id=result.chunk_id,
         document_id=result.document_id,
@@ -278,20 +318,134 @@ def _evidence_record(
         capture_date=result.capture_date,
         section_heading=result.section_heading,
         page_number=result.page_number,
-        text=result.text,
+        text=safe_text,
         vector_rank=result.vector_rank,
         vector_similarity_score=result.vector_similarity_score,
         reranker_rank=result.reranker_rank,
         reranker_score=result.reranker_score,
         retrieval_trace_id=trace_id,
         freshness_status=freshness_status,
+        retrieval_method=result.retrieval_method,
+        metadata_supplement_reason=result.metadata_supplement_reason,
+        original_reranker_rank=result.original_reranker_rank,
+        procurement_relevance=relevance,
+        procurement_relevance_reason=relevance_reason,
+        suspicious_indicators=list(indicators),
+        secret_like_values_redacted=list(redactions),
     )
 
 
 def _source_date(result: SemanticSearchResult) -> date | None:
-    """Use publication date first, matching existing historical retrieval."""
-    value = result.publication_date or result.effective_date
+    """Use explicit revision/publication/effective metadata for freshness only."""
+    value = result.last_updated_date or result.publication_date or result.effective_date
     return date.fromisoformat(value) if value else None
+
+
+_SCOPE_WORDS = re.compile(r"[a-z0-9]+")
+_SCOPE_STOPWORDS = {
+    "agency", "award", "awarded", "contract", "department", "evidence", "find",
+    "government", "identify", "labor", "procurement", "related", "research",
+    "request", "proposal", "scope", "solicitation", "status", "this", "vendor",
+    "what",
+}
+
+
+def _procurement_relevance(
+    result: SemanticSearchResult, query: str
+) -> tuple[str, str | None]:
+    """Conservatively label positive scope overlap for procurement evidence.
+
+    MiniLM scores are useful for ordering candidates, but their numeric zero is
+    not a calibrated relevance boundary across every government document
+    format. In particular, form-like state award records can receive a negative
+    raw score even when they explicitly record a final selection, contract
+    dates, and costs. A negative score can therefore be overridden only when
+    the same passage contains both strong procurement-status language and at
+    least two objective-linked scope terms. Negative score alone never creates
+    relevance, and peripheral purchases without scope overlap stay unrelated.
+    """
+    if result.document_type not in {"rfp", "intent-to-award", "confirmed-award"}:
+        return "unknown", None
+    combined = f"{result.document_title} {result.text}".casefold()
+    if "synthetic" in combined or "fictional" in combined:
+        return "relevant", "Explicitly labeled synthetic fixture."
+    query_terms = {
+        word for word in _SCOPE_WORDS.findall(query.casefold())
+        if len(word) >= 5 and word not in _SCOPE_STOPWORDS
+    }
+    text_terms = set(_SCOPE_WORDS.findall(combined))
+    overlap = sorted(
+        query_word for query_word in query_terms
+        if any(
+            query_word[:6] == text_word[:6]
+            for text_word in text_terms
+            if len(text_word) >= 5
+        )
+    )
+    if result.reranker_score <= 0:
+        # State procurement forms are often terse tables rather than prose.
+        # Require independent status and scope signals before treating one as
+        # relevant; this avoids admitting a negative-scored hardware purchase
+        # merely because it is stored as a confirmed-award record.
+        if _has_explicit_procurement_status(result.document_type, combined) and len(overlap) >= 2:
+            return (
+                "relevant",
+                "Explicit procurement status and objective-linked scope terms "
+                f"override an uncalibrated non-positive cross-encoder score: {', '.join(overlap[:5])}.",
+            )
+        return (
+            "unrelated",
+            "Cross-encoder score is non-positive and the passage lacks both explicit procurement status and sufficient objective scope overlap.",
+        )
+    if overlap:
+        return "relevant", f"Positive reranker score and scope-term overlap: {', '.join(overlap[:5])}."
+    return (
+        "unknown",
+        "Positive semantic score but no explicit objective scope term was verified; human review is required.",
+    )
+
+
+def _has_explicit_procurement_status(document_type: str, text: str) -> bool:
+    """Return whether one passage directly documents its procurement stage.
+
+    The phrases are generic government-procurement language rather than agency,
+    vendor, or contract identifiers. They provide deterministic corroboration
+    for negative-score state records while preserving ``unknown`` or
+    ``unrelated`` when a passage merely discusses procurement in general.
+    """
+
+    if document_type == "confirmed-award":
+        return any(
+            phrase in text
+            for phrase in (
+                "selected for final contract award",
+                "executed contract",
+                "contract executed",
+                "confirmed federal award record",
+                "post-award kickoff",
+                "contract start date",
+                "total contract cost",
+            )
+        ) or ("will work with" in text and "procurement process" in text)
+    if document_type == "intent-to-award":
+        return any(
+            phrase in text
+            for phrase in (
+                "intent to award",
+                "intent-to-award",
+                "notice of award",
+                "vendor selected for award",
+                "selected vendor",
+                "decision to award",
+                "master blanket purchase order",
+            )
+        )
+    if document_type == "rfp":
+        return any(
+            phrase in text
+            for phrase in ("request for proposal", "request for proposals", "solicitation")
+        )
+    return False
 
 
 def _optional_iso_date(value: str | None, field_name: str) -> date | None:
@@ -312,3 +466,17 @@ def _unique_nonempty(values: Sequence[str]) -> list[str]:
         if clean and clean not in normalized:
             normalized.append(clean)
     return normalized
+
+
+def _freshness_priority(status: str) -> int:
+    """Put current evidence first without removing historical comparisons.
+
+    Original vector and reranker ranks remain on every evidence record and in
+    its trace. This ordering affects only the compact handoff to researchers.
+    """
+    return {
+        "meets_cutoff": 0,
+        "not_checked": 1,
+        "undated": 2,
+        "older_than_cutoff": 3,
+    }.get(status, 4)

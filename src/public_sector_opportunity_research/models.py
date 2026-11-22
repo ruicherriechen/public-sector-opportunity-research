@@ -177,11 +177,14 @@ class SemanticSearchResult:
     capture_date: str
     section_heading: str | None
     page_number: int | None
-    vector_distance: float
-    vector_similarity_score: float
-    vector_rank: int
+    vector_distance: float | None
+    vector_similarity_score: float | None
+    vector_rank: int | None
     reranker_score: float
     reranker_rank: int
+    retrieval_method: str = "semantic"
+    metadata_supplement_reason: str | None = None
+    original_reranker_rank: int | None = None
 
 
 @dataclass(frozen=True)

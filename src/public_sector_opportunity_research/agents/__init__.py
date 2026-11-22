@@ -3,12 +3,13 @@
 The :mod:`public_sector_opportunity_research.agents` package is the new
 orchestration layer above the existing RAG modules.  It does not replace
 ingestion, storage, embeddings, retrieval, assessment, evaluation, or
-reporting.  Instead, its placeholder agents call a shared retrieval service
-and exchange validated, JSON-serializable records through LangGraph state.
+reporting.  Instead, its researcher and synthesis nodes call a shared retrieval
+service, use either the default deterministic mock or explicit OpenAI Structured
+Outputs, and exchange validated JSON-serializable records through graph state.
 
 Beginners should read ``contracts.py`` first, then each role module, and finish
 with ``graph.py``.  Keeping the public imports here small makes future real
-agent implementations easier to substitute without changing CLI callers.
+provider implementations easier to substitute without changing CLI callers.
 """
 
 from .contracts import ResearchGraphResult
